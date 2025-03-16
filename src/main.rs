@@ -149,9 +149,10 @@ impl Worker {
             lut,
         }
     }
-    // #[target_feature(
-    //     enable = "avx,avx2,sse2,sse3,avx512f,avx512bw,avx512vl,avx512cd,avx512vbmi,avx512vbmi2,lzcnt"
-    // )]
+
+    #[target_feature(
+        enable = "avx,avx2,sse2,sse3,sse4.2,avx512f,avx512bw,avx512vl,avx512cd,avx512vbmi,avx512vbmi2,lzcnt"
+    )]
     #[inline(never)]
     unsafe fn process_chunk(&mut self, nread: usize) {
         unsafe {
@@ -236,11 +237,6 @@ impl Worker {
 
                 let neg = ((is_neg as i32) << 31) >> 31;
                 let temperature = (i32::from_ne_bytes(temperature) ^ neg) - neg;
-
-                // println!(
-                //     "name_len={}, name_hash={} temperature={}",
-                //     name_len, name_hash, temperature
-                // );
 
                 let lut_entry = &mut self.lut[name_hash as usize % LUT_SIZE];
 
