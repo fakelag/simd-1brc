@@ -164,22 +164,23 @@ impl Worker {
             let mut chunk = &self.chunk[0..nread];
 
             // Read constraints - the chunk should end with a newline. Any extras should be
-            // stored separately and prepended to the next chunk. Finally, the file ends in a new line.
+            // stored separately and prepended to the next chunk. Finally, the file ends in a new line
             debug_assert!(chunk[chunk.len() - 1] == '\n' as u8);
 
             while chunk.len() > 0 {
                 // Idea: instead of loading 64 bytes again, try processing 2 lines at a time
                 // using shifts and avoiding branches. Technically we can try to do the same thing
                 // again after shifting by line_len + 1 bytes, but need to make sure that we don't
-                // submit the work if the next line is not complete.
+                // submit the work if the next line is not complete (this is the last line of current chunk)
                 let in_vec = _mm512_loadu_si512(chunk.as_ptr() as *const _);
 
                 // Todo: check the cost of trailing_zeros
                 let line_len = _mm512_cmpeq_epi8_mask(in_vec, nl_vec).trailing_zeros();
                 let name_len = _mm512_cmpeq_epi8_mask(in_vec, semi_vec).trailing_zeros();
 
-                // Todo: Check if line_mask can be removed
-                let line_mask = u64::MAX >> (64 - line_len);
+                // Create a mask that is 1s for the portion of the line that does not belong to the station
+                // name, including ";-." characters (inside the quotes) and the temperature reading
+                let inverse_name_line_mask = ((1 << (line_len - name_len)) - 1) << name_len;
 
                 // Hashing
                 let name_len_bits = name_len as i32 * 8;
@@ -193,7 +194,8 @@ impl Worker {
                 // Parse temperature
                 let lt_mask = _mm512_cmp_epu8_mask(in_vec, char9_vec, _MM_CMPINT_LE);
                 let gt_mask = _mm512_cmp_epu8_mask(in_vec, char0_vec, _MM_CMPINT_NLT);
-                let digit_mask = _kand_mask64(_kand_mask64(lt_mask, gt_mask), line_mask);
+                let digit_mask =
+                    _kand_mask64(_kand_mask64(lt_mask, gt_mask), inverse_name_line_mask);
 
                 let digit_vec = _mm512_subs_epi8(in_vec, char0_vec);
                 let digit_vec = _mm512_maskz_compress_epi8(digit_mask, digit_vec);
@@ -203,7 +205,7 @@ impl Worker {
 
                 // Shift digit mask to the right so it points to the byte before the first digit.
                 // This will be 0b01010 for temperatures with 2 digits and 0b10110 for temperatures with 3 digits.
-                // The first bit is always 0 (it's either the - sign or ; character depending if there is a sign character).
+                // The first bit is always 0 (it's either the - sign or ; character depending if there is a sign character)
                 let digit_mask_local = (digit_mask >> (name_len + is_neg)) as u32 as i32;
 
                 // Pick bit 3 and use it directly as the shift amount
