@@ -313,15 +313,15 @@ fn main() {
     }
 
     for (i, city) in worker.lut.iter().enumerate() {
-        if city.count != 0 {
+        if city.count == 0 {
             continue;
         }
         println!(
             "City {} [{}] - min: {}, max: {}, avg: {}",
             i,
             city.count,
-            city.min,
-            city.max,
+            city.get_min(),
+            city.get_max(),
             city.get_avg()
         );
     }
@@ -331,9 +331,15 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::{
+        collections::BTreeMap,
+        hash::{DefaultHasher, Hash, Hasher},
+        io::BufRead,
+    };
 
     use super::*;
+
+    const SAMPLE_PATH: &str = "data/sample16kb.txt";
 
     fn get_hash(vec: Vec<u8>) -> u64 {
         let mut hash = DefaultHasher::new();
@@ -342,8 +348,6 @@ mod tests {
     }
 
     fn begin_sample() -> (ChunkReader, BufReader<File>, u64) {
-        const SAMPLE_PATH: &str = "data/sample16kb.txt";
-
         let f = File::open(SAMPLE_PATH).unwrap();
         let file_reader = BufReader::new(f);
 
@@ -361,7 +365,7 @@ mod tests {
 
         let mut reconstructed = Vec::new();
         loop {
-            let read_size = chunk_reader.read_chunk(&mut file_reader, &mut chunk);
+            let read_size = chunk_reader.read_chunk::<S>(&mut file_reader, &mut chunk);
 
             reconstructed.extend_from_slice(&chunk[..read_size]);
 
@@ -371,6 +375,55 @@ mod tests {
         }
 
         assert_eq!(get_hash(reconstructed), sample_hash, "hash mismatch");
+    }
+
+    fn naive() -> BTreeMap<u32, (CityTemp, String)> {
+        let mut index: BTreeMap<u32, (CityTemp, String)> = BTreeMap::new();
+
+        let f = File::open(SAMPLE_PATH).unwrap();
+        let mut file_reader = BufReader::new(f);
+
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            let nread = file_reader.read_line(&mut buf).unwrap();
+
+            if nread == 0 {
+                break;
+            }
+
+            'top: for (ii, c) in buf.bytes().enumerate() {
+                match c {
+                    b';' => {
+                        let name_len = ii;
+
+                        let h = unsafe {
+                            let mut name_bytes = [0u8; 64];
+
+                            for i in 0..name_len {
+                                name_bytes[i] = buf.as_bytes()[i];
+                            }
+
+                            let s = _mm512_loadu_si512(name_bytes.as_ptr() as *const _);
+                            let hash = hash_512!(s);
+                            hash % LUT_SIZE as u32
+                        };
+
+                        let temp = buf[name_len + 1..].trim().parse::<f64>().unwrap();
+
+                        let entry = index
+                            .entry(h)
+                            .or_insert((CityTemp::new(), buf[..name_len].to_string()));
+                        entry.0.add((temp * 10.0) as i32);
+
+                        break 'top;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        index
     }
 
     #[test]
@@ -401,5 +454,87 @@ mod tests {
     #[test]
     fn test_chunked_reading_4096() {
         reconstruct_test::<4096>();
+    }
+
+    #[test]
+    fn test_process_chunk_correctness() {
+        let naive_result = naive();
+
+        let mut worker = Worker::new();
+
+        let (mut chunk_reader, mut file_reader, _) = begin_sample();
+
+        loop {
+            let nread = chunk_reader
+                .read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut worker.chunk[..CHUNK_SIZE]);
+
+            if nread == 0 {
+                break;
+            }
+
+            unsafe {
+                worker.process_chunk(nread);
+            }
+        }
+
+        let mut result_count = 0;
+        for (i, city) in worker.lut.iter().enumerate() {
+            if city.count == 0 {
+                continue;
+            }
+
+            result_count += 1;
+
+            let naive_city = naive_result.get(&(i as u32));
+
+            assert!(naive_city.is_some(), "city not found in naive result");
+            let (naive_city, naive_name) = naive_city.unwrap();
+
+            assert!(
+                city.count == naive_city.count,
+                "count mismatch ({}): optimised({}) != naive({})",
+                naive_name,
+                city.count,
+                naive_city.count
+            );
+
+            assert!(
+                city.get_min() == naive_city.get_min(),
+                "min mismatch ({}): optimised({}) != naive({})",
+                naive_name,
+                city.get_min(),
+                naive_city.get_min()
+            );
+
+            assert!(
+                city.get_max() == naive_city.get_max(),
+                "max mismatch ({}): optimised({}) != naive({})",
+                naive_name,
+                city.get_max(),
+                naive_city.get_max()
+            );
+
+            assert!(
+                (city.get_avg() - naive_city.get_avg()).abs() < 0.0001,
+                "avg mismatch ({}): optimised({}) != naive({})",
+                naive_name,
+                city.get_avg(),
+                naive_city.get_avg()
+            );
+        }
+
+        // Check that naive result is sensible
+        assert!(
+            naive_result.len() == 983,
+            "naive result count mismatch, got {}",
+            naive_result.len()
+        );
+
+        assert!(
+            result_count == naive_result.len(),
+            "result count mismatch: {} != {}",
+            result_count,
+            naive_result.len()
+        );
     }
 }
