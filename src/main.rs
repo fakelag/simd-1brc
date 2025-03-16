@@ -2,8 +2,10 @@
 #![feature(avx512_target_feature)]
 
 use std::arch::x86_64::*;
+use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
+use std::os::windows::fs::MetadataExt;
 
 #[inline(always)]
 fn hash_linear(str: &str) -> u32 {
@@ -72,28 +74,29 @@ fn print_m512(name: &str, m: __m512i) {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct CityTemp {
-    // Todo: store city name
-    // Todo: switch to smaller types, 999,-999 will fit in i16
-    min: i32,
-    max: i32,
+struct StationAggregate {
+    min: i16,
+    max: i16,
 
     count: u32,
     sum: i64,
+
+    name: [u8; 64],
 }
 
-impl CityTemp {
+impl StationAggregate {
     fn new() -> Self {
         Self {
-            min: i32::MAX,
-            max: i32::MIN,
+            min: i16::MAX,
+            max: i16::MIN,
             count: 0,
             sum: 0,
+            name: [0u8; 64],
         }
     }
 
     #[inline(always)]
-    fn add(&mut self, temp: i32) {
+    fn add(&mut self, temp: i16) {
         self.min = self.min.min(temp);
         self.max = self.max.max(temp);
         self.count += 1;
@@ -114,21 +117,29 @@ impl CityTemp {
     fn get_max(&self) -> f64 {
         self.max as f64 / 10.0
     }
+
+    #[inline(always)]
+    fn get_name(&self) -> Cow<'_, str> {
+        // Todo: there is a faster from_utf8_unchecked that does not check for valid utf8
+        String::from_utf8_lossy(&self.name)
+    }
 }
 
 // Todo: proper LUT size and optimise
 const LUT_SIZE: usize = 0x406FF5F;
-const CHUNK_SIZE: usize = 64; // 4 * 1024;
+const CHUNK_SIZE: usize = 4 * 1024;
+
+// Chunk align is the maximum input line length
 const CHUNK_ALIGN: usize = 64;
 
 struct Worker {
     pub chunk: [u8; CHUNK_SIZE + CHUNK_ALIGN],
-    pub lut: Box<[CityTemp; LUT_SIZE]>,
+    pub lut: Box<[StationAggregate; LUT_SIZE]>,
 }
 
 impl Worker {
     fn new() -> Self {
-        let lut = vec![CityTemp::new(); LUT_SIZE]
+        let lut = vec![StationAggregate::new(); LUT_SIZE]
             .into_boxed_slice()
             .try_into()
             .unwrap();
@@ -231,7 +242,11 @@ impl Worker {
                 //     name_len, name_hash, temperature
                 // );
 
-                self.lut[name_hash as usize % LUT_SIZE].add(temperature);
+                let lut_entry = &mut self.lut[name_hash as usize % LUT_SIZE];
+
+                _mm512_storeu_si512(lut_entry.name.as_ptr() as *mut _, name_vec);
+
+                lut_entry.add(temperature.try_into().unwrap());
 
                 chunk = &chunk[line_len as usize + 1..];
             }
@@ -243,14 +258,14 @@ impl Worker {
 
 struct ChunkReader {
     excess_len: usize,
-    excess: [u8; 64], // 64 max line length
+    excess: [u8; CHUNK_ALIGN],
 }
 
 impl ChunkReader {
     pub fn new() -> Self {
         Self {
             excess_len: 0,
-            excess: [0u8; 64],
+            excess: [0u8; CHUNK_ALIGN],
         }
     }
 }
@@ -260,24 +275,40 @@ impl ChunkReader {
         // Copy excess from a previous read to the start of the buffer
         out[..self.excess_len].copy_from_slice(&self.excess[..self.excess_len]);
 
-        // Read new data after excess
-        // Todo: check if the read chunk size can be made exact (e.g not depending on excess_len)
-        let nread = reader.read(&mut out[self.excess_len..]).unwrap();
-
         // prev_excess_len is the length of the excess currently sitting at the start of the buffer
         let prev_excess_len = self.excess_len;
 
+        // Read new data after excess
+        // Todo: check if the read chunk size can be made exact (e.g not depending on excess_len)
+        let mut nread_total = 0;
+
+        loop {
+            let nread = reader
+                .read(&mut out[prev_excess_len + nread_total..])
+                .unwrap();
+
+            nread_total += nread;
+
         // Calculate new newline cutoff for the current chunk
-        self.excess_len = out
+            self.excess_len = if let Some(excess_len) = out
             .iter()
             .skip(prev_excess_len)
-            .take(nread)
+                .take(nread_total)
             .rev()
             .position(|&c| c == b'\n')
-            .unwrap_or(0);
+            {
+                excess_len
+            } else {
+                0
+            };
+
+            if self.excess_len > 0 || nread == 0 {
+                break;
+            }
+        }
 
         // Copy new excess to the excess buffer
-        let excess_start = prev_excess_len + nread - self.excess_len;
+        let excess_start = prev_excess_len + nread_total - self.excess_len;
         self.excess[..self.excess_len]
             .copy_from_slice(&out[excess_start..excess_start + self.excess_len]);
 
@@ -296,12 +327,21 @@ impl ChunkReader {
 fn main() {
     let mut worker = Worker::new();
 
-    let f = File::open("data/sample16kb.txt").unwrap();
+    let f = File::open("data/measurements.txt").unwrap();
+    // let f = File::open("data/sample16kb.txt").unwrap();
+    let file_size = f.metadata().unwrap().file_size();
+
     let mut file_reader = BufReader::new(f);
 
     let mut chunk_reader = ChunkReader::new();
 
+    let mut read_time_ns = 0u128;
+    let mut process_time_ns = 0u128;
+    let mut nread_total = 0;
+    let read_start = std::time::Instant::now();
+
     loop {
+        let span_start = std::time::Instant::now();
         let nread = chunk_reader
             .read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut worker.chunk[..CHUNK_SIZE]);
 
@@ -309,24 +349,65 @@ fn main() {
             break;
         }
 
+        nread_total += nread;
+
+        read_time_ns += span_start.elapsed().as_nanos();
+
+        let span_start = std::time::Instant::now();
         unsafe {
             worker.process_chunk(nread);
         }
+        process_time_ns += span_start.elapsed().as_nanos();
     }
 
-    for (i, city) in worker.lut.iter().enumerate() {
-        if city.count == 0 {
-            continue;
-        }
-        println!(
-            "City {} [{}] - min: {}, max: {}, avg: {}",
-            i,
-            city.count,
-            city.get_min(),
-            city.get_max(),
-            city.get_avg()
+    println!("Aggregating results...");
+
+    let span_start = std::time::Instant::now();
+    let mut stations = worker
+        .lut
+        .iter()
+        .filter_map(|slot| {
+            if slot.count > 0 {
+                Some((slot.get_name(), slot))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    // Output must be alphabetically sorted
+    stations.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let aggregate_time_ns = span_start.elapsed().as_nanos();
+
+    let span_start = std::time::Instant::now();
+    print!("{{");
+    for (ii, result) in stations.iter().enumerate() {
+        let (name, station) = result;
+        print!(
+            "{name}={:.1}/{:.1}/{:.1}{}",
+            station.get_min(),
+            station.get_avg(),
+            station.get_max(),
+            if ii == stations.len() - 1 { "" } else { ", " },
         );
-    }
+        }
+    println!("}}");
+
+    let print_time_ns = span_start.elapsed().as_nanos();
+
+    println!(
+        "CHUNK_SIZE={}\nRead time: {}ms\nProcess time: {}ms\nAggregate time: {}ms\nPrint time: {}ms\nTotal: {}ms",
+        CHUNK_SIZE,
+        read_time_ns / 1_000_000,
+        process_time_ns / 1_000_000,
+        aggregate_time_ns / 1_000_000,
+        print_time_ns / 1_000_000,
+        read_time_ns / 1_000_000
+            + process_time_ns / 1_000_000
+            + aggregate_time_ns / 1_000_000
+            + print_time_ns / 1_000_000
+    );
 
     println!("Done");
 }
@@ -379,8 +460,8 @@ mod tests {
         assert_eq!(get_hash(reconstructed), sample_hash, "hash mismatch");
     }
 
-    fn naive() -> BTreeMap<u32, (CityTemp, String)> {
-        let mut index: BTreeMap<u32, (CityTemp, String)> = BTreeMap::new();
+    fn naive() -> BTreeMap<u32, (StationAggregate, String)> {
+        let mut index: BTreeMap<u32, (StationAggregate, String)> = BTreeMap::new();
 
         let f = File::open(SAMPLE_PATH).unwrap();
         let mut file_reader = BufReader::new(f);
@@ -399,13 +480,13 @@ mod tests {
                     b';' => {
                         let name_len = ii;
 
-                        let h = unsafe {
                             let mut name_bytes = [0u8; 64];
 
                             for i in 0..name_len {
                                 name_bytes[i] = buf.as_bytes()[i];
                             }
 
+                        let h = unsafe {
                             let s = _mm512_loadu_si512(name_bytes.as_ptr() as *const _);
                             let hash = hash_512!(s);
                             hash % LUT_SIZE as u32
@@ -415,8 +496,10 @@ mod tests {
 
                         let entry = index
                             .entry(h)
-                            .or_insert((CityTemp::new(), buf[..name_len].to_string()));
-                        entry.0.add((temp * 10.0) as i32);
+                            .or_insert((StationAggregate::new(), buf[..name_len].to_string()));
+
+                        entry.0.name = name_bytes;
+                        entry.0.add((temp * 10.0) as i16);
 
                         break 'top;
                     }
@@ -480,48 +563,56 @@ mod tests {
         }
 
         let mut result_count = 0;
-        for (i, city) in worker.lut.iter().enumerate() {
-            if city.count == 0 {
+        for (i, station) in worker.lut.iter().enumerate() {
+            if station.count == 0 {
                 continue;
             }
 
             result_count += 1;
 
-            let naive_city = naive_result.get(&(i as u32));
+            let naive_entry = naive_result.get(&(i as u32));
 
-            assert!(naive_city.is_some(), "city not found in naive result");
-            let (naive_city, naive_name) = naive_city.unwrap();
+            assert!(naive_entry.is_some(), "station not found in naive result");
+            let (naive_station, naive_name) = naive_entry.unwrap();
 
             assert!(
-                city.count == naive_city.count,
+                station.get_name() == naive_station.get_name(),
                 "count mismatch ({}): optimised({}) != naive({})",
                 naive_name,
-                city.count,
-                naive_city.count
+                station.count,
+                naive_station.count
             );
 
             assert!(
-                city.get_min() == naive_city.get_min(),
+                station.count == naive_station.count,
+                "count mismatch ({}): optimised({}) != naive({})",
+                naive_name,
+                station.count,
+                naive_station.count
+            );
+
+            assert!(
+                station.get_min() == naive_station.get_min(),
                 "min mismatch ({}): optimised({}) != naive({})",
                 naive_name,
-                city.get_min(),
-                naive_city.get_min()
+                station.get_min(),
+                naive_station.get_min()
             );
 
             assert!(
-                city.get_max() == naive_city.get_max(),
+                station.get_max() == naive_station.get_max(),
                 "max mismatch ({}): optimised({}) != naive({})",
                 naive_name,
-                city.get_max(),
-                naive_city.get_max()
+                station.get_max(),
+                naive_station.get_max()
             );
 
             assert!(
-                (city.get_avg() - naive_city.get_avg()).abs() < 0.0001,
+                (station.get_avg() - naive_station.get_avg()).abs() < 0.0001,
                 "avg mismatch ({}): optimised({}) != naive({})",
                 naive_name,
-                city.get_avg(),
-                naive_city.get_avg()
+                station.get_avg(),
+                naive_station.get_avg()
             );
         }
 
