@@ -242,7 +242,9 @@ impl Worker {
 
                 _mm512_storeu_si512(lut_entry.name.as_ptr() as *mut _, name_vec);
 
-                lut_entry.add(temperature.try_into().unwrap());
+                // According to spec temperature must be between -99.9 and 99.9
+                debug_assert!(temperature >= -999 && temperature <= 999);
+                lut_entry.add(temperature as i16);
 
                 chunk = &chunk[line_len as usize + 1..];
             }
