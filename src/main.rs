@@ -101,42 +101,53 @@ impl CityTemp {
     }
 
     #[inline(always)]
-    fn avg(&self) -> f64 {
-        self.sum as f64 / self.count as f64
+    fn get_avg(&self) -> f64 {
+        self.sum as f64 / self.count as f64 / 10.0
+    }
+
+    #[inline(always)]
+    fn get_min(&self) -> f64 {
+        self.min as f64 / 10.0
+    }
+
+    #[inline(always)]
+    fn get_max(&self) -> f64 {
+        self.max as f64 / 10.0
     }
 }
 
 // Todo: proper LUT size and optimise
-const LUT_SIZE: usize = 10; // 0x3FFFFFFF;
+const LUT_SIZE: usize = 0x406FF5F;
 const CHUNK_SIZE: usize = 64; // 4 * 1024;
 const CHUNK_ALIGN: usize = 64;
 
 struct Worker {
-    pub chunk: [u8; CHUNK_SIZE],
-    pub temp_table: Box<[CityTemp; LUT_SIZE]>,
+    pub chunk: [u8; CHUNK_SIZE + CHUNK_ALIGN],
+    pub lut: Box<[CityTemp; LUT_SIZE]>,
 }
 
 impl Worker {
     fn new() -> Self {
-        let temp_table = vec![CityTemp::new(); LUT_SIZE]
+        let lut = vec![CityTemp::new(); LUT_SIZE]
             .into_boxed_slice()
             .try_into()
             .unwrap();
 
         Self {
-            chunk: [0u8; CHUNK_SIZE],
-            temp_table,
+            chunk: [0u8; CHUNK_SIZE + CHUNK_ALIGN],
+            lut,
         }
     }
     // #[target_feature(
     //     enable = "avx,avx2,sse2,sse3,avx512f,avx512bw,avx512vl,avx512cd,avx512vbmi,avx512vbmi2,lzcnt"
     // )]
     #[inline(never)]
-    unsafe fn process_chunk(&mut self) {
+    unsafe fn process_chunk(&mut self, nread: usize) {
         unsafe {
             let semi_vec = _mm512_set1_epi8(';' as i8);
             let nl_vec = _mm512_set1_epi8('\n' as i8);
             let char0_vec = _mm512_set1_epi8('0' as i8);
+            let char9_vec = _mm512_set1_epi8('9' as i8);
             let neg_vec = _mm512_set1_epi8('-' as i8);
             let mul_vec = _mm512_set1_epi32(0x00010A64);
             let ff_vec = _mm512_set1_epi32(-1);
@@ -144,12 +155,19 @@ impl Worker {
                 512, 480, 448, 416, 384, 352, 320, 288, 256, 224, 192, 160, 128, 96, 64, 32,
             );
 
-            let mut chunk = &self.chunk as &[u8];
+            // Read constraints - nread is CHUNK_SIZE or less. self.chunk is CHUNK_SIZE + CHUNK_ALIGN,
+            // meaning that we can read up to 64 bytes into a mm512 past the end of the chunk. These reads
+            // will fill the remaining of the register with 0s
+            debug_assert!(nread <= CHUNK_SIZE);
+            debug_assert!(self.chunk.len() <= CHUNK_SIZE + CHUNK_ALIGN);
 
-            println!("start chunk={:?}", String::from_utf8(chunk.to_vec()));
-            println!("start chunk.len={}", chunk.len());
+            let mut chunk = &self.chunk[0..nread];
 
-            while chunk.len() >= 64 {
+            // Read constraints - the chunk should end with a newline. Any extras should be
+            // stored separately and prepended to the next chunk. Finally, the file ends in a new line.
+            debug_assert!(chunk[chunk.len() - 1] == '\n' as u8);
+
+            while chunk.len() > 0 {
                 // Idea: instead of loading 64 bytes again, try processing 2 lines at a time
                 // using shifts and avoiding branches. Technically we can try to do the same thing
                 // again after shifting by line_len + 1 bytes, but need to make sure that we don't
@@ -173,10 +191,8 @@ impl Worker {
                 let name_hash = hash_512!(name_vec);
 
                 // Parse temperature
-                let lt_mask =
-                    _mm512_cmp_epu8_mask(in_vec, _mm512_set1_epi8('9' as i8), _MM_CMPINT_LE);
-                let gt_mask =
-                    _mm512_cmp_epu8_mask(in_vec, _mm512_set1_epi8('0' as i8), _MM_CMPINT_NLT);
+                let lt_mask = _mm512_cmp_epu8_mask(in_vec, char9_vec, _MM_CMPINT_LE);
+                let gt_mask = _mm512_cmp_epu8_mask(in_vec, char0_vec, _MM_CMPINT_NLT);
                 let digit_mask = _kand_mask64(_kand_mask64(lt_mask, gt_mask), line_mask);
 
                 let digit_vec = _mm512_subs_epi8(in_vec, char0_vec);
@@ -208,21 +224,16 @@ impl Worker {
                 let neg = ((is_neg as i32) << 31) >> 31;
                 let temperature = (i32::from_ne_bytes(temperature) ^ neg) - neg;
 
-                println!(
-                    "name_len={}, name_hash={}, temperature={}",
-                    name_len, name_hash, temperature
-                );
+                // println!(
+                //     "name_len={}, name_hash={} temperature={}",
+                //     name_len, name_hash, temperature
+                // );
 
-                self.temp_table[name_hash as usize % LUT_SIZE].add(temperature);
+                self.lut[name_hash as usize % LUT_SIZE].add(temperature);
 
                 chunk = &chunk[line_len as usize + 1..];
             }
 
-            println!("end chunk={:?}", String::from_utf8(chunk.to_vec()));
-            println!("end chunk.len={}", chunk.len());
-
-            // Todo: Process the last line. Maybe the reader can always allocate
-            // chunks on a 64 byte boundary
             assert!(chunk.is_empty());
         }
     }
@@ -243,15 +254,12 @@ impl ChunkReader {
 }
 impl ChunkReader {
     #[inline(always)]
-    pub fn read_chunk<const S: usize>(
-        &mut self,
-        reader: &mut impl Read,
-        out: &mut [u8; S],
-    ) -> usize {
+    pub fn read_chunk<const S: usize>(&mut self, reader: &mut impl Read, out: &mut [u8]) -> usize {
         // Copy excess from a previous read to the start of the buffer
         out[..self.excess_len].copy_from_slice(&self.excess[..self.excess_len]);
 
         // Read new data after excess
+        // Todo: check if the read chunk size can be made exact (e.g not depending on excess_len)
         let nread = reader.read(&mut out[self.excess_len..]).unwrap();
 
         // prev_excess_len is the length of the excess currently sitting at the start of the buffer
@@ -291,10 +299,31 @@ fn main() {
 
     let mut chunk_reader = ChunkReader::new();
 
-    while chunk_reader.read_chunk(&mut file_reader, &mut worker.chunk) > 0 {
-        unsafe {
-            worker.process_chunk();
+    loop {
+        let nread = chunk_reader
+            .read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut worker.chunk[..CHUNK_SIZE]);
+
+        if nread == 0 {
+            break;
         }
+
+        unsafe {
+            worker.process_chunk(nread);
+        }
+    }
+
+    for (i, city) in worker.lut.iter().enumerate() {
+        if city.count != 0 {
+            continue;
+        }
+        println!(
+            "City {} [{}] - min: {}, max: {}, avg: {}",
+            i,
+            city.count,
+            city.min,
+            city.max,
+            city.get_avg()
+        );
     }
 
     println!("Done");
