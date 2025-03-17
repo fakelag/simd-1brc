@@ -39,8 +39,8 @@ fn hash_crc32_linear(str: &str) -> u32 {
 
 macro_rules! hash_512 {
     ($s:ident) => {{
-        let set0 = _mm512_castsi512_si256(_mm512_maskz_compress_epi64(0x0F, $s));
-        let set1 = _mm512_castsi512_si256(_mm512_maskz_compress_epi64(0xF0, $s));
+        let set0 = _mm512_castsi512_si256($s);
+        let set1 = _mm512_extracti64x4_epi64($s, 1);
 
         let mut crc = 0;
         crc = _mm_crc32_u64(crc, _mm256_extract_epi64(set0, 0) as u64);
@@ -71,6 +71,14 @@ fn print_m512(name: &str, m: __m512i) {
         _mm512_storeu_si512(arr.as_mut_ptr() as *mut _, m);
     }
     println!("{} {:?}", name, arr);
+}
+
+fn print_m512_string(name: &str, m: __m512i) {
+    let mut arr = [0u8; 64];
+    unsafe {
+        _mm512_storeu_si512(arr.as_mut_ptr() as *mut _, m);
+    }
+    println!("{} {:?}", name, String::from_utf8_lossy(&arr));
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,21 +159,25 @@ impl Worker {
     }
 
     #[target_feature(
-        enable = "avx,avx2,sse2,sse3,sse4.2,avx512f,avx512bw,avx512vl,avx512cd,avx512vbmi,avx512vbmi2,lzcnt"
+        enable = "avx,avx2,sse2,sse3,sse4.2,avx512f,avx512bw,avx512vl,avx512cd,avx512vbmi,avx512vbmi2"
     )]
-    #[inline(never)]
+    #[inline(never)] // Todo: remove
     unsafe fn process_chunk(&mut self, nread: usize) {
         unsafe {
+            // Prepare vectors that contain characters for parsing
             let semi_vec = _mm512_set1_epi8(';' as i8);
             let nl_vec = _mm512_set1_epi8('\n' as i8);
             let char0_vec = _mm512_set1_epi8('0' as i8);
             let char9_vec = _mm512_set1_epi8('9' as i8);
             let neg_vec = _mm512_set1_epi8('-' as i8);
+            let zero_vec = _mm512_setzero_si512();
+
+            // Temperatures are floating points with a single decimal point. Parsing
+            // will take advantage of this by compressing the digits into 32-bits which
+            // can be vertically multiplied by this vector to get an integer value for
+            // the final temperature. Temperature integer can then be divided by 10 during
+            // aggregation to get the final floating point value.
             let mul_vec = _mm512_set1_epi32(0x00010A64);
-            let ff_vec = _mm512_set1_epi32(-1);
-            let cnst32_vec = _mm512_set_epi32(
-                512, 480, 448, 416, 384, 352, 320, 288, 256, 224, 192, 160, 128, 96, 64, 32,
-            );
 
             // Read constraints - nread is CHUNK_SIZE or less. self.chunk is CHUNK_SIZE + CHUNK_ALIGN,
             // meaning that we can read up to 64 bytes into a mm512 past the end of the chunk. These reads
@@ -177,37 +189,34 @@ impl Worker {
 
             // Read constraints - the chunk should end with a newline. Any extras should be
             // stored separately and prepended to the next chunk. Finally, the file ends in a new line
+            debug_assert!(!chunk.is_empty());
             debug_assert!(chunk[chunk.len() - 1] == '\n' as u8);
 
-            while chunk.len() > 0 {
-                // Idea: instead of loading 64 bytes again, try processing 2 lines at a time
-                // using shifts and avoiding branches. Technically we can try to do the same thing
-                // again after shifting by line_len + 1 bytes, but need to make sure that we don't
-                // submit the work if the next line is not complete (this is the last line of current chunk)
+            loop {
+                // Read the next 512-bits from the input chunk into in_vec. The chunk buffer contains
+                // a zero-filled 64 bytes padding at the end which may be read to the vector
                 let in_vec = _mm512_loadu_si512(chunk.as_ptr() as *const _);
 
-                // Todo: check the cost of trailing_zeros
-                let line_len = _mm512_cmpeq_epi8_mask(in_vec, nl_vec).trailing_zeros();
-                let name_len = _mm512_cmpeq_epi8_mask(in_vec, semi_vec).trailing_zeros();
+                // Test against special characters (; for name end and \n for line end) and
+                // find the lengths of the corresponding components in the input by counting trailing ones
+                let line_len = _mm512_cmpneq_epi8_mask(in_vec, nl_vec).trailing_ones();
+                let name_len = _mm512_cmpneq_epi8_mask(in_vec, semi_vec).trailing_ones();
+
+                // Create a mask that is 1s for the station name portion of the line
+                let name_line_mask = 0xFFFFFFFF_FFFFFFFFu64 >> (64 - name_len);
 
                 // Create a mask that is 1s for the portion of the line that does not belong to the station
                 // name, including ";-." characters (inside the quotes) and the temperature reading
-                let inverse_name_line_mask = ((1 << (line_len - name_len)) - 1) << name_len;
+                let rest_line_mask = ((1 << (line_len - name_len)) - 1) << name_len;
 
-                // Hashing
-                let name_len_bits = name_len as i32 * 8;
-                let shift = _mm512_subs_epu16(cnst32_vec, _mm512_set1_epi32(name_len_bits));
-                let name_mask = _mm512_srlv_epi32(ff_vec, shift);
-
-                let name_vec = _mm512_and_si512(in_vec, name_mask);
-
+                // Generate a hash for the name. Bits that are not part of the station name are set to 0
+                let name_vec = _mm512_mask_mov_epi8(zero_vec, name_line_mask, in_vec);
                 let name_hash = hash_512!(name_vec);
 
                 // Parse temperature
                 let lt_mask = _mm512_cmp_epu8_mask(in_vec, char9_vec, _MM_CMPINT_LE);
                 let gt_mask = _mm512_cmp_epu8_mask(in_vec, char0_vec, _MM_CMPINT_NLT);
-                let digit_mask =
-                    _kand_mask64(_kand_mask64(lt_mask, gt_mask), inverse_name_line_mask);
+                let digit_mask = _kand_mask64(_kand_mask64(lt_mask, gt_mask), rest_line_mask);
 
                 let digit_vec = _mm512_subs_epi8(in_vec, char0_vec);
                 let digit_vec = _mm512_maskz_compress_epi8(digit_mask, digit_vec);
@@ -226,14 +235,11 @@ impl Worker {
 
                 let shifted = _mm512_sllv_epi32(digit_vec, _mm512_set1_epi32(shift));
 
-                let sum = _mm512_maddubs_epi16(shifted, mul_vec);
-                let sum = _mm512_castsi128_si512(_mm_hadd_epi16(
-                    _mm512_castsi512_si128(sum),
-                    _mm512_castsi512_si128(sum),
-                ));
+                let sum = _mm512_castsi512_si128(_mm512_maddubs_epi16(shifted, mul_vec));
+                let sum = _mm_hadd_epi16(sum, sum);
 
                 let temperature = [0u8; 4];
-                _mm_storeu_si32(temperature.as_ptr() as *mut _, _mm512_castsi512_si128(sum));
+                _mm_storeu_si32(temperature.as_ptr() as *mut _, sum);
 
                 let neg = ((is_neg as i32) << 31) >> 31;
                 let temperature = (i32::from_ne_bytes(temperature) ^ neg) - neg;
@@ -247,9 +253,11 @@ impl Worker {
                 lut_entry.add(temperature as i16);
 
                 chunk = &chunk[line_len as usize + 1..];
-            }
 
-            assert!(chunk.is_empty());
+                if chunk.is_empty() {
+                    break;
+                }
+            }
         }
     }
 }
