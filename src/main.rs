@@ -295,13 +295,13 @@ impl ChunkReader {
 
             nread_total += nread;
 
-        // Calculate new newline cutoff for the current chunk
+            // Calculate new newline cutoff for the current chunk
             self.excess_len = if let Some(excess_len) = out
-            .iter()
-            .skip(prev_excess_len)
+                .iter()
+                .skip(prev_excess_len)
                 .take(nread_total)
-            .rev()
-            .position(|&c| c == b'\n')
+                .rev()
+                .position(|&c| c == b'\n')
             {
                 excess_len
             } else {
@@ -397,7 +397,7 @@ fn main() {
             station.get_max(),
             if ii == stations.len() - 1 { "" } else { ", " },
         );
-        }
+    }
     println!("}}");
 
     let print_time_ns = span_start.elapsed().as_nanos();
@@ -421,7 +421,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         hash::{DefaultHasher, Hash, Hasher},
         io::BufRead,
     };
@@ -429,6 +429,7 @@ mod tests {
     use super::*;
 
     const SAMPLE_PATH: &str = "data/sample16kb.txt";
+    const STATIONS_PATH: &str = "data/weather_stations.csv";
 
     fn get_hash(vec: Vec<u8>) -> u64 {
         let mut hash = DefaultHasher::new();
@@ -486,11 +487,11 @@ mod tests {
                     b';' => {
                         let name_len = ii;
 
-                            let mut name_bytes = [0u8; 64];
+                        let mut name_bytes = [0u8; 64];
 
-                            for i in 0..name_len {
-                                name_bytes[i] = buf.as_bytes()[i];
-                            }
+                        for i in 0..name_len {
+                            name_bytes[i] = buf.as_bytes()[i];
+                        }
 
                         let h = unsafe {
                             let s = _mm512_loadu_si512(name_bytes.as_ptr() as *const _);
@@ -635,5 +636,49 @@ mod tests {
             result_count,
             naive_result.len()
         );
+    }
+
+    #[test]
+    fn test_hashing() {
+        let weather_stations = fs::read(STATIONS_PATH).unwrap();
+
+        let mut weather_stations = weather_stations
+            .split(|&c| c == b'\n')
+            .map(|row| String::from_utf8(row.to_vec()).unwrap())
+            .filter(|row| !row.starts_with("#"))
+            .filter_map(|row| {
+                let mut split = row.split(';');
+                let name = split.next().unwrap();
+
+                if name.is_empty() {
+                    return None;
+                }
+
+                Some(name.to_string())
+            })
+            .collect::<Vec<_>>();
+
+        weather_stations.sort();
+        weather_stations.dedup();
+
+        let mut index = BTreeSet::new();
+
+        for station_name in &weather_stations {
+            let mut string_bytes = [0u8; 64];
+            for (i, byte) in station_name.bytes().enumerate() {
+                string_bytes[i] = byte;
+            }
+            let h = unsafe {
+                let s = _mm512_loadu_si512(string_bytes.as_ptr() as *const _);
+                let h = hash_512!(s);
+                h % LUT_SIZE as u32
+            };
+
+            assert!(
+                index.insert(h),
+                "hash collision found for station: {}",
+                station_name
+            );
+        }
     }
 }
