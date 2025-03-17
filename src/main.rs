@@ -135,13 +135,13 @@ impl StationAggregate {
 
 // Todo: proper LUT size and optimise
 const LUT_SIZE: usize = 0x406FF5F;
-const CHUNK_SIZE: usize = 4 * 1024;
+const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 // Chunk align is the maximum input line length
 const CHUNK_ALIGN: usize = 64;
 
 struct Worker {
-    pub chunk: [u8; CHUNK_SIZE + CHUNK_ALIGN],
+    pub chunk: Box<[u8; CHUNK_SIZE + CHUNK_ALIGN]>,
     pub lut: Box<[StationAggregate; LUT_SIZE]>,
 }
 
@@ -153,7 +153,10 @@ impl Worker {
             .unwrap();
 
         Self {
-            chunk: [0u8; CHUNK_SIZE + CHUNK_ALIGN],
+            chunk: vec![0u8; CHUNK_SIZE + CHUNK_ALIGN]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
             lut,
         }
     }
@@ -335,7 +338,7 @@ fn main() {
 
     let f = File::open("data/measurements.txt").unwrap();
     // let f = File::open("data/sample16kb.txt").unwrap();
-    let file_size = f.metadata().unwrap().file_size();
+    // let file_size = f.metadata().unwrap().file_size();
 
     let mut file_reader = BufReader::new(f);
 
