@@ -4,7 +4,7 @@
 
 use std::arch::x86_64::*;
 use std::borrow::Cow;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufReader, Read};
 
 mod fastmap;
@@ -118,8 +118,6 @@ impl StationAggregate {
     }
 }
 
-// Todo: proper LUT size and optimise
-const LUT_SIZE: usize = 0x406FF5F;
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 // Chunk align is the maximum input line length
@@ -127,22 +125,20 @@ const CHUNK_ALIGN: usize = 64;
 
 struct Worker {
     pub chunk: Box<[u8; CHUNK_SIZE + CHUNK_ALIGN]>,
-    pub lut: Box<[StationAggregate; LUT_SIZE]>,
+    pub map: fastmap::FastMap<{ Self::BUCKET_BITS }, { Self::SLOT_BITS }, StationAggregate>,
 }
 
 impl Worker {
-    fn new() -> Self {
-        let lut = vec![StationAggregate::new(); LUT_SIZE]
-            .into_boxed_slice()
-            .try_into()
-            .unwrap();
+    const BUCKET_BITS: usize = 13;
+    const SLOT_BITS: usize = 4;
 
+    fn new() -> Self {
         Self {
             chunk: vec![0u8; CHUNK_SIZE + CHUNK_ALIGN]
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
-            lut,
+            map: fastmap::FastMap::new(),
         }
     }
 
@@ -226,19 +222,21 @@ impl Worker {
                 let sum = _mm512_castsi512_si128(_mm512_maddubs_epi16(shifted, mul_vec));
                 let sum = _mm_hadd_epi16(sum, sum);
 
-                let temperature = [0u8; 4];
-                _mm_storeu_si32(temperature.as_ptr() as *mut _, sum);
+                let mut temperature = [0u8; 4];
+                _mm_storeu_si32(temperature.as_mut_ptr() as *mut _, sum);
 
                 let neg = ((is_neg as i32) << 31) >> 31;
                 let temperature = (i32::from_ne_bytes(temperature) ^ neg) - neg;
 
-                let lut_entry = &mut self.lut[name_hash as usize % LUT_SIZE];
+                let bucket = Self::hash_u32(name_hash);
 
-                _mm512_storeu_si512(lut_entry.name.as_ptr() as *mut _, name_vec);
+                let entry = self.map.get_insert(name_hash, bucket);
+
+                _mm512_storeu_si512(entry.name.as_mut_ptr() as *mut _, name_vec);
 
                 // According to spec temperature must be between -99.9 and 99.9
                 debug_assert!(temperature >= -999 && temperature <= 999);
-                lut_entry.add(temperature as i16);
+                entry.add(temperature as i16);
 
                 chunk = &chunk[line_len as usize + 1..];
 
@@ -247,6 +245,12 @@ impl Worker {
                 }
             }
         }
+    }
+
+    #[inline(always)]
+    fn hash_u32(val: u32) -> u32 {
+        // Black magic seed for optimal distribution
+        val.wrapping_mul(0x5bc9d60a) >> (32 - Self::BUCKET_BITS)
     }
 }
 
@@ -322,8 +326,6 @@ fn main() {
     let mut worker = Worker::new();
 
     let f = File::open("data/measurements.txt").unwrap();
-    // let f = File::open("data/sample16kb.txt").unwrap();
-    // let file_size = f.metadata().unwrap().file_size();
 
     let mut file_reader = BufReader::new(f);
 
@@ -331,8 +333,6 @@ fn main() {
 
     let mut read_time_ns = 0u128;
     let mut process_time_ns = 0u128;
-    let mut nread_total = 0;
-    let read_start = std::time::Instant::now();
 
     loop {
         let span_start = std::time::Instant::now();
@@ -342,8 +342,6 @@ fn main() {
         if nread == 0 {
             break;
         }
-
-        nread_total += nread;
 
         read_time_ns += span_start.elapsed().as_nanos();
 
@@ -358,7 +356,8 @@ fn main() {
 
     let span_start = std::time::Instant::now();
     let mut stations = worker
-        .lut
+        .map
+        .backing
         .iter()
         .filter_map(|slot| {
             if slot.count > 0 {
@@ -409,7 +408,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{BTreeMap, BTreeSet},
+        collections::BTreeMap,
+        fs,
         hash::{DefaultHasher, Hash, Hasher},
         io::BufRead,
     };
@@ -455,8 +455,8 @@ mod tests {
         assert_eq!(get_hash(reconstructed), sample_hash, "hash mismatch");
     }
 
-    fn naive() -> BTreeMap<u32, (StationAggregate, String)> {
-        let mut index: BTreeMap<u32, (StationAggregate, String)> = BTreeMap::new();
+    fn naive() -> BTreeMap<String, StationAggregate> {
+        let mut index: BTreeMap<String, StationAggregate> = BTreeMap::new();
 
         let f = File::open(SAMPLE_PATH).unwrap();
         let mut file_reader = BufReader::new(f);
@@ -481,20 +481,14 @@ mod tests {
                             name_bytes[i] = buf.as_bytes()[i];
                         }
 
-                        let h = unsafe {
-                            let s = _mm512_loadu_si512(name_bytes.as_ptr() as *const _);
-                            let hash = hash_512!(s);
-                            hash % LUT_SIZE as u32
-                        };
-
                         let temp = buf[name_len + 1..].trim().parse::<f64>().unwrap();
 
-                        let entry = index
-                            .entry(h)
-                            .or_insert((StationAggregate::new(), buf[..name_len].to_string()));
+                        let name = buf[..name_len].to_string();
 
-                        entry.0.name = name_bytes;
-                        entry.0.add((temp * 10.0) as i16);
+                        let entry = index.entry(name).or_insert(StationAggregate::new());
+
+                        entry.name = name_bytes;
+                        entry.add((temp * 10.0) as i16);
 
                         break 'top;
                     }
@@ -507,32 +501,12 @@ mod tests {
     }
 
     #[test]
-    fn test_chunked_reading_10() {
+    fn test_chunked_reading() {
         reconstruct_test::<10>();
-    }
-
-    #[test]
-    fn test_chunked_reading_32() {
         reconstruct_test::<32>();
-    }
-
-    #[test]
-    fn test_chunked_reading_64() {
         reconstruct_test::<64>();
-    }
-
-    #[test]
-    fn test_chunked_reading_512() {
         reconstruct_test::<512>();
-    }
-
-    #[test]
-    fn test_chunked_reading_1024() {
         reconstruct_test::<1024>();
-    }
-
-    #[test]
-    fn test_chunked_reading_4096() {
         reconstruct_test::<4096>();
     }
 
@@ -558,30 +532,32 @@ mod tests {
         }
 
         let mut result_count = 0;
-        for (i, station) in worker.lut.iter().enumerate() {
+        for (i, station) in worker.map.backing.iter().enumerate() {
             if station.count == 0 {
                 continue;
             }
 
             result_count += 1;
 
-            let naive_entry = naive_result.get(&(i as u32));
+            let station_name = station.get_name();
 
-            assert!(naive_entry.is_some(), "station not found in naive result");
-            let (naive_station, naive_name) = naive_entry.unwrap();
+            let name_length = station_name.find('\0').unwrap_or(64);
+            let station_name_trimmed = station_name.split_at(name_length).0;
+
+            let naive_entry = naive_result.get(station_name_trimmed);
 
             assert!(
-                station.get_name() == naive_station.get_name(),
-                "count mismatch ({}): optimised({}) != naive({})",
-                naive_name,
-                station.count,
-                naive_station.count
+                naive_entry.is_some(),
+                "station {} not found in naive result (name={})",
+                i,
+                station_name,
             );
+            let naive_station = naive_entry.unwrap();
 
             assert!(
                 station.count == naive_station.count,
                 "count mismatch ({}): optimised({}) != naive({})",
-                naive_name,
+                naive_station.get_name(),
                 station.count,
                 naive_station.count
             );
@@ -589,7 +565,7 @@ mod tests {
             assert!(
                 station.get_min() == naive_station.get_min(),
                 "min mismatch ({}): optimised({}) != naive({})",
-                naive_name,
+                naive_station.get_name(),
                 station.get_min(),
                 naive_station.get_min()
             );
@@ -597,7 +573,7 @@ mod tests {
             assert!(
                 station.get_max() == naive_station.get_max(),
                 "max mismatch ({}): optimised({}) != naive({})",
-                naive_name,
+                naive_station.get_name(),
                 station.get_max(),
                 naive_station.get_max()
             );
@@ -605,7 +581,7 @@ mod tests {
             assert!(
                 (station.get_avg() - naive_station.get_avg()).abs() < 0.0001,
                 "avg mismatch ({}): optimised({}) != naive({})",
-                naive_name,
+                naive_station.get_name(),
                 station.get_avg(),
                 naive_station.get_avg()
             );
@@ -628,6 +604,8 @@ mod tests {
 
     #[test]
     fn test_hashing() {
+        const WORKER_BUCKET_SLOTS: usize = 1 << Worker::SLOT_BITS;
+
         let weather_stations = fs::read(STATIONS_PATH).unwrap();
 
         let mut weather_stations = weather_stations
@@ -649,7 +627,7 @@ mod tests {
         weather_stations.sort();
         weather_stations.dedup();
 
-        let mut index = BTreeSet::new();
+        let mut index: BTreeMap<u32, usize> = BTreeMap::new();
 
         for station_name in &weather_stations {
             let mut string_bytes = [0u8; 64];
@@ -659,12 +637,16 @@ mod tests {
             let h = unsafe {
                 let s = _mm512_loadu_si512(string_bytes.as_ptr() as *const _);
                 let h = hash_512!(s);
-                h % LUT_SIZE as u32
+                Worker::hash_u32(h)
             };
 
+            let entry = index.entry(h).or_insert(0);
+            *entry += 1;
+
             assert!(
-                index.insert(h),
-                "hash collision found for station: {}",
+                *entry <= WORKER_BUCKET_SLOTS,
+                "too many hash collisions for hash {} ({})",
+                h,
                 station_name
             );
         }
