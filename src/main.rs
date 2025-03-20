@@ -1,41 +1,13 @@
 #![feature(stdarch_x86_avx512)]
 #![feature(avx512_target_feature)]
+#![feature(generic_const_exprs)]
 
 use std::arch::x86_64::*;
 use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
-use std::os::windows::fs::MetadataExt;
 
-#[inline(always)]
-fn hash_linear(str: &str) -> u32 {
-    let mut h = 0u32;
-    for c in str.bytes() {
-        h = 37u32.wrapping_mul(h).wrapping_add(c as u32);
-    }
-    h
-}
-
-#[inline(always)]
-fn hash_crc32_linear(str: &str) -> u32 {
-    let mut string_bytes = [0u8; 64];
-
-    for (i, byte) in str.bytes().enumerate() {
-        string_bytes[i] = byte;
-    }
-
-    let mut crc = 0;
-    for i in (0..64).step_by(8) {
-        unsafe {
-            crc = _mm_crc32_u64(
-                crc,
-                u64::from_ne_bytes(string_bytes[i..i + 8].try_into().unwrap_unchecked()),
-            );
-        }
-    }
-
-    crc as u32
-}
+mod fastmap;
 
 macro_rules! hash_512 {
     ($s:ident) => {{
@@ -90,6 +62,18 @@ struct StationAggregate {
     sum: i64,
 
     name: [u8; 64],
+}
+
+impl Default for StationAggregate {
+    fn default() -> Self {
+        Self {
+            min: i16::MAX,
+            max: i16::MIN,
+            count: 0,
+            sum: 0,
+            name: [0u8; 64],
+        }
+    }
 }
 
 impl StationAggregate {

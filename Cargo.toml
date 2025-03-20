@@ -9,3 +9,6 @@ edition = "2024"
 strip = false
 debug = true
 debuginfo-level = 2
+
+[dependencies]
+rand = "0.9.0"
