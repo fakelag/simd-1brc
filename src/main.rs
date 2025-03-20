@@ -143,7 +143,7 @@ impl Worker {
     }
 
     #[target_feature(
-        enable = "avx,avx2,sse2,sse3,sse4.2,avx512f,avx512bw,avx512vl,avx512cd,avx512vbmi,avx512vbmi2"
+        enable = "avx,avx2,sse2,sse3,sse4.2,avx512f,avx512bw,avx512vl,avx512cd,avx512vbmi,avx512vbmi2,bmi1,popcnt"
     )]
     #[inline(never)] // Todo: remove
     unsafe fn process_chunk(&mut self, nread: usize) {
