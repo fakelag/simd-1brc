@@ -11,19 +11,20 @@ mod fastmap;
 
 macro_rules! hash_512 {
     ($s:ident) => {{
-        let set0 = _mm512_castsi512_si256($s);
-        let set1 = _mm512_extracti64x4_epi64($s, 1);
+        let mut data = [0u64; 8];
+        _mm512_storeu_si512(data.as_mut_ptr() as *mut _, $s);
 
         let mut crc = 0;
-        crc = _mm_crc32_u64(crc, _mm256_extract_epi64(set0, 0) as u64);
-        crc = _mm_crc32_u64(crc, _mm256_extract_epi64(set0, 1) as u64);
-        crc = _mm_crc32_u64(crc, _mm256_extract_epi64(set0, 2) as u64);
-        crc = _mm_crc32_u64(crc, _mm256_extract_epi64(set0, 3) as u64);
 
-        crc = _mm_crc32_u64(crc, _mm256_extract_epi64(set1, 0) as u64);
-        crc = _mm_crc32_u64(crc, _mm256_extract_epi64(set1, 1) as u64);
-        crc = _mm_crc32_u64(crc, _mm256_extract_epi64(set1, 2) as u64);
-        crc = _mm_crc32_u64(crc, _mm256_extract_epi64(set1, 3) as u64);
+        crc = _mm_crc32_u64(crc, data[0]);
+        crc = _mm_crc32_u64(crc, data[1]);
+        crc = _mm_crc32_u64(crc, data[2]);
+        crc = _mm_crc32_u64(crc, data[3]);
+
+        crc = _mm_crc32_u64(crc, data[4]);
+        crc = _mm_crc32_u64(crc, data[5]);
+        crc = _mm_crc32_u64(crc, data[6]);
+        crc = _mm_crc32_u64(crc, data[7]);
 
         crc as u32
     }};
