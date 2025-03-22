@@ -59,6 +59,7 @@ struct StationAggregate {
     min: i16,
     max: i16,
 
+    // Todo: check the dataset to see if any of these types can be shrunk
     count: u32,
     sum: i64,
 
@@ -118,10 +119,9 @@ impl StationAggregate {
     }
 }
 
-const CHUNK_SIZE: usize = 4 * 1024 * 1024;
-
 // Chunk align is the maximum input line length
 const CHUNK_ALIGN: usize = 64;
+const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
 struct Worker {
     pub chunk: Box<[u8; CHUNK_SIZE + CHUNK_ALIGN]>,
