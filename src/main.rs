@@ -6,6 +6,7 @@ use std::arch::x86_64::*;
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufReader, Read};
+use std::sync::{Arc, Mutex};
 
 mod fastmap;
 
@@ -98,6 +99,14 @@ impl StationAggregate {
     }
 
     #[inline(always)]
+    fn collapse(&mut self, &other: &Self) {
+        self.min = self.min.min(other.min);
+        self.max = self.max.max(other.max);
+        self.count += other.count;
+        self.sum += other.sum;
+    }
+
+    #[inline(always)]
     fn get_avg(&self) -> f64 {
         self.sum as f64 / self.count as f64 / 10.0
     }
@@ -123,30 +132,70 @@ impl StationAggregate {
 const CHUNK_ALIGN: usize = 64;
 const CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
-struct Worker {
-    pub chunk: Box<[u8; CHUNK_SIZE + CHUNK_ALIGN]>,
-    pub map: fastmap::FastMap<{ Self::BUCKET_BITS }, { Self::SLOT_BITS }, StationAggregate>,
+struct StationMap {
+    map: fastmap::FastMap<{ Self::BUCKET_BITS }, { Self::SLOT_BITS }, StationAggregate>,
 }
 
-impl Worker {
+impl StationMap {
     const BUCKET_BITS: usize = 13;
     const SLOT_BITS: usize = 4;
 
+    #[inline(always)]
+    pub fn get_mut(
+        &mut self,
+    ) -> &mut fastmap::FastMap<{ Self::BUCKET_BITS }, { Self::SLOT_BITS }, StationAggregate> {
+        &mut self.map
+    }
+
+    #[inline(always)]
+    pub fn get(
+        &self,
+    ) -> &fastmap::FastMap<{ Self::BUCKET_BITS }, { Self::SLOT_BITS }, StationAggregate> {
+        &self.map
+    }
+
+    #[inline(always)]
+    fn hash_u32(val: u32) -> u32 {
+        // Black magic seed for optimal distribution
+        val.wrapping_mul(0x5bc9d60a) >> (32 - Self::BUCKET_BITS)
+    }
+}
+
+struct Batch {
+    pub nread: usize,
+    pub chunk: Box<[u8; CHUNK_SIZE + CHUNK_ALIGN]>,
+    pub map: StationMap,
+}
+
+impl Batch {
     fn new() -> Self {
         Self {
+            nread: 0,
             chunk: vec![0u8; CHUNK_SIZE + CHUNK_ALIGN]
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
-            map: fastmap::FastMap::new(),
+            map: StationMap {
+                map: fastmap::FastMap::new(),
+            },
         }
+    }
+}
+
+struct Worker {
+    pub batch: Arc<Mutex<Batch>>,
+}
+
+impl Worker {
+    pub fn new(batch: Arc<Mutex<Batch>>) -> Self {
+        Self { batch }
     }
 
     #[target_feature(
         enable = "avx,avx2,sse2,sse3,sse4.2,avx512f,avx512bw,avx512vl,avx512cd,avx512vbmi,avx512vbmi2,bmi1,popcnt"
     )]
     #[inline(never)] // Todo: remove
-    unsafe fn process_chunk(&mut self, nread: usize) {
+    unsafe fn run(&mut self) {
         unsafe {
             // Prepare vectors that contain characters for parsing
             let semi_vec = _mm512_set1_epi8(';' as i8);
@@ -163,94 +212,99 @@ impl Worker {
             // aggregation to get the final floating point value.
             let mul_vec = _mm512_set1_epi32(0x00010A64);
 
-            // Read constraints - nread is CHUNK_SIZE or less. self.chunk is CHUNK_SIZE + CHUNK_ALIGN,
-            // meaning that we can read up to 64 bytes into a mm512 past the end of the chunk. These reads
-            // will fill the remaining of the register with 0s
-            debug_assert!(nread <= CHUNK_SIZE);
-            debug_assert!(self.chunk.len() <= CHUNK_SIZE + CHUNK_ALIGN);
-
-            let mut chunk = &self.chunk[0..nread];
-
-            // Read constraints - the chunk should end with a newline. Any extras should be
-            // stored separately and prepended to the next chunk. Finally, the file ends in a new line
-            debug_assert!(!chunk.is_empty());
-            debug_assert!(chunk[chunk.len() - 1] == '\n' as u8);
-
             loop {
-                // Read the next 512-bits from the input chunk into in_vec. The chunk buffer contains
-                // a zero-filled 64 bytes padding at the end which may be read to the vector
-                let in_vec = _mm512_loadu_si512(chunk.as_ptr() as *const _);
+                let mut lock = self.batch.lock();
+                let batch = lock.as_deref_mut().unwrap();
 
-                // Test against special characters (; for name end and \n for line end) and
-                // find the lengths of the corresponding components in the input by counting trailing ones
-                let line_len = _mm512_cmpneq_epi8_mask(in_vec, nl_vec).trailing_ones();
-                let name_len = _mm512_cmpneq_epi8_mask(in_vec, semi_vec).trailing_ones();
-
-                // Create a mask that is 1s for the station name portion of the line
-                let name_line_mask = 0xFFFFFFFF_FFFFFFFFu64 >> (64 - name_len);
-
-                // Create a mask that is 1s for the portion of the line that does not belong to the station
-                // name, including ";-." characters (inside the quotes) and the temperature reading
-                let rest_line_mask = ((1 << (line_len - name_len)) - 1) << name_len;
-
-                // Generate a hash for the name. Bits that are not part of the station name are set to 0
-                let name_vec = _mm512_mask_mov_epi8(zero_vec, name_line_mask, in_vec);
-                let name_hash = hash_512!(name_vec);
-
-                // Parse temperature
-                let lt_mask = _mm512_cmp_epu8_mask(in_vec, char9_vec, _MM_CMPINT_LE);
-                let gt_mask = _mm512_cmp_epu8_mask(in_vec, char0_vec, _MM_CMPINT_NLT);
-                let digit_mask = _kand_mask64(_kand_mask64(lt_mask, gt_mask), rest_line_mask);
-
-                let digit_vec = _mm512_subs_epi8(in_vec, char0_vec);
-                let digit_vec = _mm512_maskz_compress_epi8(digit_mask, digit_vec);
-
-                let neg_mask = _mm512_cmpeq_epi8_mask(in_vec, neg_vec);
-                let is_neg = ((neg_mask >> (name_len + 1)) & 1) as u32;
-
-                // Shift digit mask to the right so it points to the byte before the first digit.
-                // This will be 0b01010 for temperatures with 2 digits and 0b10110 for temperatures with 3 digits.
-                // The first bit is always 0 (it's either the - sign or ; character depending if there is a sign character)
-                let digit_mask_local = (digit_mask >> (name_len + is_neg)) as u32 as i32;
-
-                // Pick bit 3 and use it directly as the shift amount
-                // (e.g shift 8 bits for 2 digit numbers or 0 bits for 3 digit numbers)
-                let shift = digit_mask_local & 0b1000;
-
-                let shifted = _mm512_sllv_epi32(digit_vec, _mm512_set1_epi32(shift));
-
-                let sum = _mm512_castsi512_si128(_mm512_maddubs_epi16(shifted, mul_vec));
-                let sum = _mm_hadd_epi16(sum, sum);
-
-                let mut temperature = [0u8; 4];
-                _mm_storeu_si32(temperature.as_mut_ptr() as *mut _, sum);
-
-                let neg = ((is_neg as i32) << 31) >> 31;
-                let temperature = (i32::from_ne_bytes(temperature) ^ neg) - neg;
-
-                let bucket = Self::hash_u32(name_hash);
-
-                let entry = self.map.get_insert(name_hash, bucket);
-
-                _mm512_storeu_si512(entry.name.as_mut_ptr() as *mut _, name_vec);
-
-                // According to spec temperature must be between -99.9 and 99.9
-                debug_assert!(temperature >= -999 && temperature <= 999);
-                entry.add(temperature as i16);
-
-                chunk = &chunk[line_len as usize + 1..];
-
-                if chunk.is_empty() {
-                    break;
+                if batch.nread == 0 {
+                    continue;
                 }
+
+                // Read constraints - nread is CHUNK_SIZE or less. self.chunk is CHUNK_SIZE + CHUNK_ALIGN,
+                // meaning that we can read up to 64 bytes into a mm512 past the end of the chunk. These reads
+                // will fill the remaining of the register with 0s
+                debug_assert!(batch.nread <= CHUNK_SIZE);
+                debug_assert!(batch.chunk.len() <= CHUNK_SIZE + CHUNK_ALIGN);
+
+                let mut chunk = &batch.chunk[0..batch.nread];
+
+                // Read constraints - the chunk should end with a newline. Any extras should be
+                // stored separately and prepended to the next chunk. Finally, the file ends in a new line
+                debug_assert!(!chunk.is_empty());
+                debug_assert!(chunk[chunk.len() - 1] == '\n' as u8);
+
+                loop {
+                    // Read the next 512-bits from the input chunk into in_vec. The chunk buffer contains
+                    // a zero-filled 64 bytes padding at the end which may be read to the vector
+                    let in_vec = _mm512_loadu_si512(chunk.as_ptr() as *const _);
+
+                    // Test against special characters (; for name end and \n for line end) and
+                    // find the lengths of the corresponding components in the input by counting trailing ones
+                    let line_len = _mm512_cmpneq_epi8_mask(in_vec, nl_vec).trailing_ones();
+                    let name_len = _mm512_cmpneq_epi8_mask(in_vec, semi_vec).trailing_ones();
+
+                    // Create a mask that is 1s for the station name portion of the line
+                    let name_line_mask = 0xFFFFFFFF_FFFFFFFFu64 >> (64 - name_len);
+
+                    // Create a mask that is 1s for the portion of the line that does not belong to the station
+                    // name, including ";-." characters (inside the quotes) and the temperature reading
+                    let rest_line_mask = ((1 << (line_len - name_len)) - 1) << name_len;
+
+                    // Generate a hash for the name. Bits that are not part of the station name are set to 0
+                    let name_vec = _mm512_mask_mov_epi8(zero_vec, name_line_mask, in_vec);
+                    let name_hash = hash_512!(name_vec);
+
+                    // Parse temperature
+                    let lt_mask = _mm512_cmp_epu8_mask(in_vec, char9_vec, _MM_CMPINT_LE);
+                    let gt_mask = _mm512_cmp_epu8_mask(in_vec, char0_vec, _MM_CMPINT_NLT);
+                    let digit_mask = _kand_mask64(_kand_mask64(lt_mask, gt_mask), rest_line_mask);
+
+                    let digit_vec = _mm512_subs_epi8(in_vec, char0_vec);
+                    let digit_vec = _mm512_maskz_compress_epi8(digit_mask, digit_vec);
+
+                    let neg_mask = _mm512_cmpeq_epi8_mask(in_vec, neg_vec);
+                    let is_neg = ((neg_mask >> (name_len + 1)) & 1) as u32;
+
+                    // Shift digit mask to the right so it points to the byte before the first digit.
+                    // This will be 0b01010 for temperatures with 2 digits and 0b10110 for temperatures with 3 digits.
+                    // The first bit is always 0 (it's either the - sign or ; character depending if there is a sign character)
+                    let digit_mask_local = (digit_mask >> (name_len + is_neg)) as u32 as i32;
+
+                    // Pick bit 3 and use it directly as the shift amount
+                    // (e.g shift 8 bits for 2 digit numbers or 0 bits for 3 digit numbers)
+                    let shift = digit_mask_local & 0b1000;
+
+                    let shifted = _mm512_sllv_epi32(digit_vec, _mm512_set1_epi32(shift));
+
+                    let sum = _mm512_castsi512_si128(_mm512_maddubs_epi16(shifted, mul_vec));
+                    let sum = _mm_hadd_epi16(sum, sum);
+
+                    let mut temperature = [0u8; 4];
+                    _mm_storeu_si32(temperature.as_mut_ptr() as *mut _, sum);
+
+                    let neg = ((is_neg as i32) << 31) >> 31;
+                    let temperature = (i32::from_ne_bytes(temperature) ^ neg) - neg;
+
+                    let bucket = StationMap::hash_u32(name_hash);
+
+                    let entry = batch.map.get_mut().get_insert(name_hash, bucket);
+
+                    _mm512_storeu_si512(entry.name.as_mut_ptr() as *mut _, name_vec);
+
+                    // According to spec temperature must be between -99.9 and 99.9
+                    debug_assert!(temperature >= -999 && temperature <= 999);
+                    entry.add(temperature as i16);
+
+                    chunk = &chunk[line_len as usize + 1..];
+
+                    if chunk.is_empty() {
+                        break;
+                    }
+                }
+
+                batch.nread = 0;
             }
         }
-    }
-
-    #[inline(always)]
-    fn hash_u32(val: u32) -> u32 {
-        // Black magic seed for optimal distribution
-        val.wrapping_mul(0x5bc9d60a) >> (32 - Self::BUCKET_BITS)
     }
 }
 
@@ -323,7 +377,32 @@ impl ChunkReader {
 }
 
 fn main() {
-    let mut worker = Worker::new();
+    const NUM_WORKERS: usize = 8;
+
+    let start_time = std::time::Instant::now();
+
+    let workers = (0..NUM_WORKERS)
+        .map(|_| Worker::new(Arc::new(Mutex::new(Batch::new()))))
+        .collect::<Vec<_>>();
+
+    let batches = workers
+        .iter()
+        .map(|worker| worker.batch.clone())
+        .collect::<Vec<_>>();
+
+    let worker_threads = workers
+        .into_iter()
+        .enumerate()
+        .map(|(ii, mut worker)| {
+            std::thread::spawn(move || {
+                println!("Worker started: {:?}", ii);
+
+                unsafe {
+                    worker.run();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
 
     let f = File::open("data/measurements.txt").unwrap();
 
@@ -332,40 +411,75 @@ fn main() {
     let mut chunk_reader = ChunkReader::new();
 
     let mut read_time_ns = 0u128;
-    let mut process_time_ns = 0u128;
+    let mut waitlock_time_ns = 0u128;
 
     loop {
         let span_start = std::time::Instant::now();
-        let nread = chunk_reader
-            .read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut worker.chunk[..CHUNK_SIZE]);
+
+        let mut batch = batches
+            .iter()
+            .cycle()
+            .map(|batch| batch.try_lock())
+            .skip_while(|lock_res| lock_res.is_err() || lock_res.as_ref().unwrap().nread != 0)
+            .next()
+            .unwrap()
+            .unwrap();
+
+        waitlock_time_ns += span_start.elapsed().as_nanos();
+
+        let span_start = std::time::Instant::now();
+        let nread =
+            chunk_reader.read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut batch.chunk[..CHUNK_SIZE]);
 
         if nread == 0 {
             break;
         }
 
-        read_time_ns += span_start.elapsed().as_nanos();
+        batch.nread = nread;
 
-        let span_start = std::time::Instant::now();
-        unsafe {
-            worker.process_chunk(nread);
-        }
-        process_time_ns += span_start.elapsed().as_nanos();
+        read_time_ns += span_start.elapsed().as_nanos();
     }
 
     println!("Aggregating results...");
 
     let span_start = std::time::Instant::now();
-    let mut stations = worker
-        .map
+
+    let mut global_map = StationMap {
+        map: fastmap::FastMap::new(),
+    };
+
+    for batch in batches {
+        let batch = batch.lock().unwrap();
+
+        for slot in batch.map.get().backing.iter() {
+            if slot.count == 0 {
+                continue;
+            }
+
+            let entry = unsafe {
+                // Todo: use cpu features
+                let s = _mm512_loadu_si512(slot.name.as_ptr() as *const _);
+                let hash = hash_512!(s);
+
+                global_map
+                    .get_mut()
+                    .get_insert(hash, StationMap::hash_u32(hash))
+            };
+
+            if entry.count == 0 {
+                *entry = *slot;
+            } else {
+                entry.collapse(&slot);
+            }
+        }
+    }
+
+    let mut stations = global_map
+        .get()
         .backing
         .iter()
-        .filter_map(|slot| {
-            if slot.count > 0 {
-                Some((slot.get_name(), slot))
-            } else {
-                None
-            }
-        })
+        .filter(|slot| slot.count > 0)
+        .map(|slot| (slot.get_name().into_owned(), slot))
         .collect::<Vec<_>>();
 
     // Output must be alphabetically sorted
@@ -375,14 +489,15 @@ fn main() {
 
     let span_start = std::time::Instant::now();
     print!("{{");
-    for (ii, result) in stations.iter().enumerate() {
+    let num_stations = stations.len();
+    for (ii, result) in stations.into_iter().enumerate() {
         let (name, station) = result;
         print!(
             "{name}={:.1}/{:.1}/{:.1}{}",
             station.get_min(),
             station.get_avg(),
             station.get_max(),
-            if ii == stations.len() - 1 { "" } else { ", " },
+            if ii == num_stations - 1 { "" } else { ", " },
         );
     }
     println!("}}");
@@ -390,17 +505,19 @@ fn main() {
     let print_time_ns = span_start.elapsed().as_nanos();
 
     println!(
-        "CHUNK_SIZE={}\nRead time: {}ms\nProcess time: {}ms\nAggregate time: {}ms\nPrint time: {}ms\nTotal: {}ms",
+        "CHUNK_SIZE={}\nRead time: {}ms\nLock wait time: {}ms\nAggregate time: {}ms\nPrint time: {}ms\nTotal: {}ms",
         CHUNK_SIZE,
         read_time_ns / 1_000_000,
-        process_time_ns / 1_000_000,
+        waitlock_time_ns / 1_000_000,
         aggregate_time_ns / 1_000_000,
         print_time_ns / 1_000_000,
-        read_time_ns / 1_000_000
-            + process_time_ns / 1_000_000
-            + aggregate_time_ns / 1_000_000
-            + print_time_ns / 1_000_000
+        start_time.elapsed().as_millis()
     );
+
+    // println!("Waiting for workers to exit...");
+    // for worker in worker_threads {
+    //     worker.join().unwrap();
+    // }
 
     println!("Done");
 }
