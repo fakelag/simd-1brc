@@ -219,6 +219,7 @@ impl<'a> Worker<'a> {
             let mul_vec = _mm512_set1_epi32(0x00010A64);
 
             loop {
+                // Todo: set.start to return a guard with Drop impl that commits the set for safety
                 let (nread, batch) = match self.set.start(self.index) {
                     Some(batch) => batch,
                     None => break,
@@ -381,16 +382,14 @@ impl ChunkReader {
     }
 }
 
-fn main() {
-    let start_time = std::time::Instant::now();
-
-    let f = File::open("data/measurements.txt").unwrap();
+#[target_feature(enable = "avx512f,sse4.2")]
+unsafe fn process_stations<'a>(
+    measurements_filepath: &str,
+    station_map: &'a mut StationMap,
+) -> Vec<(String, &'a StationAggregate)> {
+    let f = File::open(measurements_filepath).unwrap();
     let mut file_reader = BufReader::new(f);
     let mut chunk_reader = ChunkReader::new();
-
-    let mut read_time_ns = 0u128;
-    let mut waitlock_time_ns = 0u128;
-    let mut waitclose_time_ns = 0u128;
 
     let ws = WorkSet::<NUM_WORKERS, Batch>::new();
 
@@ -402,8 +401,6 @@ fn main() {
                 let mut worker = Worker::new(ii, ws);
 
                 s.spawn(move || {
-                    println!("Worker started: {:?}", ii);
-
                     unsafe {
                         worker.run();
                     }
@@ -414,13 +411,8 @@ fn main() {
             .collect::<Vec<_>>();
 
         loop {
-            let span_start = std::time::Instant::now();
-
             let (index, set) = ws.acquire();
 
-            waitlock_time_ns += span_start.elapsed().as_nanos();
-
-            let span_start = std::time::Instant::now();
             let nread = chunk_reader
                 .read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut set.chunk[..CHUNK_SIZE]);
 
@@ -429,13 +421,7 @@ fn main() {
             }
 
             ws.commit(index, nread.try_into().unwrap());
-
-            read_time_ns += span_start.elapsed().as_nanos();
         }
-
-        println!("Closing workset...");
-
-        let span_start = std::time::Instant::now();
 
         ws.close();
 
@@ -444,18 +430,8 @@ fn main() {
             .map(|worker| worker.join().unwrap())
             .collect::<Vec<_>>();
 
-        waitclose_time_ns += span_start.elapsed().as_nanos();
-
         results
     });
-
-    println!("Aggregating results...");
-
-    let span_start = std::time::Instant::now();
-
-    let mut global_map = StationMap {
-        map: fastmap::FastMap::new(),
-    };
 
     for result in &results {
         for slot in result.get().backing.iter() {
@@ -464,11 +440,10 @@ fn main() {
             }
 
             let entry = unsafe {
-                // Todo: use cpu features
                 let s = _mm512_loadu_si512(slot.name.as_ptr() as *const _);
                 let hash = hash_512!(s);
 
-                global_map
+                station_map
                     .get_mut()
                     .get_insert(hash, StationMap::hash_u32(hash))
             };
@@ -481,7 +456,7 @@ fn main() {
         }
     }
 
-    let mut stations = global_map
+    let mut stations = station_map
         .get()
         .backing
         .iter()
@@ -492,35 +467,50 @@ fn main() {
     // Output must be alphabetically sorted
     stations.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let aggregate_time_ns = span_start.elapsed().as_nanos();
+    stations
+}
 
-    let span_start = std::time::Instant::now();
-    print!("{{");
+fn main() {
+    use std::io::Write;
+
+    let start_time = std::time::Instant::now();
+    const FILE_PATH: &str = "data/measurements.txt";
+
+    let mut station_map = StationMap {
+        map: fastmap::FastMap::new(),
+    };
+
+    let stations = unsafe { process_stations(FILE_PATH, &mut station_map) };
+
+    let print_start = std::time::Instant::now();
+
+    let mut buf_writer = std::io::BufWriter::new(std::io::stdout().lock());
+
+    buf_writer.write(b"{").unwrap();
+
     let num_stations = stations.len();
     for (ii, result) in stations.into_iter().enumerate() {
         let (name, station) = result;
-        print!(
-            "{name}={:.1}/{:.1}/{:.1}{}",
-            station.get_min(),
-            station.get_avg(),
-            station.get_max(),
-            if ii == num_stations - 1 { "" } else { ", " },
-        );
+        let name = name.trim_end_matches('\0');
+        buf_writer
+            .write_fmt(format_args!(
+                "{name}={:.1}/{:.1}/{:.1}{}",
+                station.get_min(),
+                station.get_avg(),
+                station.get_max(),
+                if ii == num_stations - 1 { "" } else { ", " },
+            ))
+            .unwrap();
     }
-    println!("}}");
+    buf_writer.write(b"}").unwrap();
 
-    let print_time_ns = span_start.elapsed().as_nanos();
+    buf_writer.flush().unwrap();
 
-    println!(
-        "CHUNK_SIZE={}\nRead time: {}ms\nLock wait time: {}ms\nWait close time: {}ms\nAggregate time: {}ms\nPrint time: {}ms\nTotal: {}ms",
-        CHUNK_SIZE,
-        read_time_ns / 1_000_000,
-        waitlock_time_ns / 1_000_000,
-        waitclose_time_ns / 1_000_000,
-        aggregate_time_ns / 1_000_000,
-        print_time_ns / 1_000_000,
-        start_time.elapsed().as_millis()
-    );
+    let print_time = print_start.elapsed();
+
+    println!("\nPrint took: {}ms", print_time.as_millis());
+
+    println!("Took: {}ms", start_time.elapsed().as_millis());
 
     println!("Done");
 }
@@ -575,10 +565,10 @@ mod tests {
         assert_eq!(get_hash(reconstructed), sample_hash, "hash mismatch");
     }
 
-    fn naive() -> BTreeMap<String, StationAggregate> {
+    fn naive(path: &str) -> BTreeMap<String, StationAggregate> {
         let mut index: BTreeMap<String, StationAggregate> = BTreeMap::new();
 
-        let f = File::open(SAMPLE_PATH).unwrap();
+        let f = File::open(path).unwrap();
         let mut file_reader = BufReader::new(f);
 
         let mut buf = String::new();
@@ -630,97 +620,77 @@ mod tests {
         reconstruct_test::<4096>();
     }
 
-    // #[test]
-    // fn test_process_chunk_correctness() {
-    //     let naive_result = naive();
+    #[test]
+    fn test_process_chunk_correctness() {
+        let naive_result = naive(SAMPLE_PATH);
 
-    //     let mut worker = Worker::new();
+        let mut station_map = StationMap {
+            map: fastmap::FastMap::new(),
+        };
 
-    //     let (mut chunk_reader, mut file_reader, _) = begin_sample();
+        let stations = unsafe { process_stations(SAMPLE_PATH, &mut station_map) };
 
-    //     loop {
-    //         let nread = chunk_reader
-    //             .read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut worker.chunk[..CHUNK_SIZE]);
+        let mut result_count = 0;
+        for (i, (station_name, station)) in stations.into_iter().enumerate() {
+            result_count += 1;
 
-    //         if nread == 0 {
-    //             break;
-    //         }
+            let naive_entry = naive_result.get(station_name.trim_end_matches('\0'));
 
-    //         unsafe {
-    //             worker.process_chunk(nread);
-    //         }
-    //     }
+            assert!(
+                naive_entry.is_some(),
+                "station {} not found in naive result (name={})",
+                i,
+                station_name,
+            );
+            let naive_station = naive_entry.unwrap();
 
-    //     let mut result_count = 0;
-    //     for (i, station) in worker.map.backing.iter().enumerate() {
-    //         if station.count == 0 {
-    //             continue;
-    //         }
+            assert!(
+                station.count == naive_station.count,
+                "count mismatch ({}): optimised({}) != naive({})",
+                naive_station.get_name(),
+                station.count,
+                naive_station.count
+            );
 
-    //         result_count += 1;
+            assert!(
+                station.get_min() == naive_station.get_min(),
+                "min mismatch ({}): optimised({}) != naive({})",
+                naive_station.get_name(),
+                station.get_min(),
+                naive_station.get_min()
+            );
 
-    //         let station_name = station.get_name();
+            assert!(
+                station.get_max() == naive_station.get_max(),
+                "max mismatch ({}): optimised({}) != naive({})",
+                naive_station.get_name(),
+                station.get_max(),
+                naive_station.get_max()
+            );
 
-    //         let name_length = station_name.find('\0').unwrap_or(64);
-    //         let station_name_trimmed = station_name.split_at(name_length).0;
+            assert!(
+                (station.get_avg() - naive_station.get_avg()).abs() < 0.0001,
+                "avg mismatch ({}): optimised({}) != naive({})",
+                naive_station.get_name(),
+                station.get_avg(),
+                naive_station.get_avg()
+            );
+        }
 
-    //         let naive_entry = naive_result.get(station_name_trimmed);
+        // Check that naive result is sensible
+        assert!(
+            naive_result.len() == 983,
+            "naive result count mismatch, got {}",
+            naive_result.len()
+        );
 
-    //         assert!(
-    //             naive_entry.is_some(),
-    //             "station {} not found in naive result (name={})",
-    //             i,
-    //             station_name,
-    //         );
-    //         let naive_station = naive_entry.unwrap();
-
-    //         assert!(
-    //             station.count == naive_station.count,
-    //             "count mismatch ({}): optimised({}) != naive({})",
-    //             naive_station.get_name(),
-    //             station.count,
-    //             naive_station.count
-    //         );
-
-    //         assert!(
-    //             station.get_min() == naive_station.get_min(),
-    //             "min mismatch ({}): optimised({}) != naive({})",
-    //             naive_station.get_name(),
-    //             station.get_min(),
-    //             naive_station.get_min()
-    //         );
-
-    //         assert!(
-    //             station.get_max() == naive_station.get_max(),
-    //             "max mismatch ({}): optimised({}) != naive({})",
-    //             naive_station.get_name(),
-    //             station.get_max(),
-    //             naive_station.get_max()
-    //         );
-
-    //         assert!(
-    //             (station.get_avg() - naive_station.get_avg()).abs() < 0.0001,
-    //             "avg mismatch ({}): optimised({}) != naive({})",
-    //             naive_station.get_name(),
-    //             station.get_avg(),
-    //             naive_station.get_avg()
-    //         );
-    //     }
-
-    //     // Check that naive result is sensible
-    //     assert!(
-    //         naive_result.len() == 983,
-    //         "naive result count mismatch, got {}",
-    //         naive_result.len()
-    //     );
-
-    //     assert!(
-    //         result_count == naive_result.len(),
-    //         "result count mismatch: {} != {}",
-    //         result_count,
-    //         naive_result.len()
-    //     );
-    // }
+        assert!(
+            result_count == naive_result.len(),
+            "result count mismatch: {} != {}",
+            result_count,
+            naive_result.len()
+        );
+    }
 
     #[test]
     fn test_hashing() {

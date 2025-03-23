@@ -78,6 +78,8 @@ where
             } else if signal != 0 {
                 break signal;
             }
+
+            std::hint::spin_loop();
         };
 
         std::sync::atomic::fence(Ordering::Acquire);
