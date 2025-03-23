@@ -66,7 +66,10 @@ where
         unsafe {
             // Load index of the bucket. The first element is a mask of already populated slots.
             // The element contains an array of the populated keys. Next we will find which slot
-            let index = &mut self.index[(bucket & Self::INDEX_MASK) as usize];
+            #[cfg(feature = "safety_checks")]
+            let index = &mut self.index[bucket as usize];
+            #[cfg(not(feature = "safety_checks"))]
+            let index = &mut self.index.get_unchecked_mut(bucket as usize);
 
             // Load 512 bits from the index key-part into a vector. Depending on SLOT_BITS this
             // may load partially past the end of the array which won't be compared against due to the mask
@@ -93,18 +96,24 @@ where
             // 1 if the bucket does not contain the key (an insert is needed)
             let is_miss_bit = (cmp_bits == 0) as u16;
 
-            debug_assert!(slot < Self::BUCKET_SIZE);
-            debug_assert!(bucket * Self::BUCKET_SIZE + slot < Self::BACKING_SIZE);
+            #[cfg(feature = "safety_checks")]
+            {
+                assert!(slot < Self::BUCKET_SIZE);
+                assert!(bucket * Self::BUCKET_SIZE + slot < Self::BACKING_SIZE);
+            }
 
             // Logic insert into the index that will not make
             // any changes if the slot is already populated
-            index.1[(slot & Self::SLOT_MASK) as usize] = key;
+            *index.1.get_unchecked_mut(slot as usize) = key;
             index.0 <<= is_miss_bit;
             index.0 |= is_miss_bit;
 
-            let backing_index = ((bucket * Self::BUCKET_SIZE + slot) & Self::BACKING_MASK) as usize;
-
-            &mut self.backing[backing_index]
+            #[cfg(feature = "safety_checks")]
+            return &mut self.backing[(bucket * Self::BUCKET_SIZE + slot) as usize];
+            #[cfg(not(feature = "safety_checks"))]
+            return self
+                .backing
+                .get_unchecked_mut((bucket * Self::BUCKET_SIZE + slot) as usize);
         }
     }
 

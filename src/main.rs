@@ -301,7 +301,14 @@ impl<'a> Worker<'a> {
                     debug_assert!(temperature >= -999 && temperature <= 999);
                     entry.add(temperature as i16);
 
+                    #[cfg(feature = "safety_checks")]
+                    {
                     chunk = &chunk[line_len as usize + 1..];
+                    }
+                    #[cfg(not(feature = "safety_checks"))]
+                    {
+                        chunk = &chunk.get_unchecked(line_len as usize + 1..);
+                    }
 
                     if chunk.is_empty() {
                         break;
