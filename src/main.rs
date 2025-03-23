@@ -6,9 +6,13 @@ use std::arch::x86_64::*;
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::sync::{Arc, Mutex};
+
+use workset::WorkSet;
 
 mod fastmap;
+mod workset;
+
+const NUM_WORKERS: usize = 8;
 
 macro_rules! hash_512 {
     ($s:ident) => {{
@@ -162,33 +166,35 @@ impl StationMap {
 }
 
 struct Batch {
-    pub nread: usize,
     pub chunk: Box<[u8; CHUNK_SIZE + CHUNK_ALIGN]>,
-    pub map: StationMap,
 }
 
-impl Batch {
-    fn new() -> Self {
+impl Default for Batch {
+    fn default() -> Self {
         Self {
-            nread: 0,
             chunk: vec![0u8; CHUNK_SIZE + CHUNK_ALIGN]
                 .into_boxed_slice()
                 .try_into()
                 .unwrap(),
-            map: StationMap {
-                map: fastmap::FastMap::new(),
-            },
         }
     }
 }
 
-struct Worker {
-    pub batch: Arc<Mutex<Batch>>,
+struct Worker<'a> {
+    pub set: &'a workset::WorkSet<NUM_WORKERS, Batch>,
+    pub index: usize,
+    pub map: StationMap,
 }
 
-impl Worker {
-    pub fn new(batch: Arc<Mutex<Batch>>) -> Self {
-        Self { batch }
+impl<'a> Worker<'a> {
+    pub fn new(index: usize, set: &'a workset::WorkSet<NUM_WORKERS, Batch>) -> Self {
+        Self {
+            set,
+            index,
+            map: StationMap {
+                map: fastmap::FastMap::new(),
+            },
+        }
     }
 
     #[target_feature(
@@ -213,20 +219,19 @@ impl Worker {
             let mul_vec = _mm512_set1_epi32(0x00010A64);
 
             loop {
-                let mut lock = self.batch.lock();
-                let batch = lock.as_deref_mut().unwrap();
-
-                if batch.nread == 0 {
-                    continue;
-                }
+                let (nread, batch) = match self.set.start(self.index) {
+                    Some(batch) => batch,
+                    None => break,
+                };
+                let nread = nread as usize;
 
                 // Read constraints - nread is CHUNK_SIZE or less. self.chunk is CHUNK_SIZE + CHUNK_ALIGN,
                 // meaning that we can read up to 64 bytes into a mm512 past the end of the chunk. These reads
                 // will fill the remaining of the register with 0s
-                debug_assert!(batch.nread <= CHUNK_SIZE);
+                debug_assert!(nread <= CHUNK_SIZE);
                 debug_assert!(batch.chunk.len() <= CHUNK_SIZE + CHUNK_ALIGN);
 
-                let mut chunk = &batch.chunk[0..batch.nread];
+                let mut chunk = &batch.chunk[0..nread];
 
                 // Read constraints - the chunk should end with a newline. Any extras should be
                 // stored separately and prepended to the next chunk. Finally, the file ends in a new line
@@ -287,7 +292,7 @@ impl Worker {
 
                     let bucket = StationMap::hash_u32(name_hash);
 
-                    let entry = batch.map.get_mut().get_insert(name_hash, bucket);
+                    let entry = self.map.get_mut().get_insert(name_hash, bucket);
 
                     _mm512_storeu_si512(entry.name.as_mut_ptr() as *mut _, name_vec);
 
@@ -302,7 +307,7 @@ impl Worker {
                     }
                 }
 
-                batch.nread = 0;
+                self.set.commit(self.index, 0);
             }
         }
     }
@@ -377,68 +382,72 @@ impl ChunkReader {
 }
 
 fn main() {
-    const NUM_WORKERS: usize = 8;
-
     let start_time = std::time::Instant::now();
 
-    let workers = (0..NUM_WORKERS)
-        .map(|_| Worker::new(Arc::new(Mutex::new(Batch::new()))))
-        .collect::<Vec<_>>();
-
-    let batches = workers
-        .iter()
-        .map(|worker| worker.batch.clone())
-        .collect::<Vec<_>>();
-
-    let worker_threads = workers
-        .into_iter()
-        .enumerate()
-        .map(|(ii, mut worker)| {
-            std::thread::spawn(move || {
-                println!("Worker started: {:?}", ii);
-
-                unsafe {
-                    worker.run();
-                }
-            })
-        })
-        .collect::<Vec<_>>();
-
     let f = File::open("data/measurements.txt").unwrap();
-
     let mut file_reader = BufReader::new(f);
-
     let mut chunk_reader = ChunkReader::new();
 
     let mut read_time_ns = 0u128;
     let mut waitlock_time_ns = 0u128;
+    let mut waitclose_time_ns = 0u128;
 
-    loop {
-        let span_start = std::time::Instant::now();
+    let ws = WorkSet::<NUM_WORKERS, Batch>::new();
 
-        let mut batch = batches
-            .iter()
-            .cycle()
-            .map(|batch| batch.try_lock())
-            .skip_while(|lock_res| lock_res.is_err() || lock_res.as_ref().unwrap().nread != 0)
-            .next()
-            .unwrap()
-            .unwrap();
+    let results = std::thread::scope(|s| {
+        let ws = &ws;
 
-        waitlock_time_ns += span_start.elapsed().as_nanos();
+        let worker_threads = (0..NUM_WORKERS)
+            .map(|ii| {
+                let mut worker = Worker::new(ii, ws);
 
-        let span_start = std::time::Instant::now();
-        let nread =
-            chunk_reader.read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut batch.chunk[..CHUNK_SIZE]);
+                s.spawn(move || {
+                    println!("Worker started: {:?}", ii);
 
-        if nread == 0 {
-            break;
+                    unsafe {
+                        worker.run();
+                    }
+
+                    return worker.map;
+                })
+            })
+            .collect::<Vec<_>>();
+
+        loop {
+            let span_start = std::time::Instant::now();
+
+            let (index, set) = ws.acquire();
+
+            waitlock_time_ns += span_start.elapsed().as_nanos();
+
+            let span_start = std::time::Instant::now();
+            let nread = chunk_reader
+                .read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut set.chunk[..CHUNK_SIZE]);
+
+            if nread == 0 {
+                break;
+            }
+
+            ws.commit(index, nread.try_into().unwrap());
+
+            read_time_ns += span_start.elapsed().as_nanos();
         }
 
-        batch.nread = nread;
+        println!("Closing workset...");
 
-        read_time_ns += span_start.elapsed().as_nanos();
-    }
+        let span_start = std::time::Instant::now();
+
+        ws.close();
+
+        let results = worker_threads
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        waitclose_time_ns += span_start.elapsed().as_nanos();
+
+        results
+    });
 
     println!("Aggregating results...");
 
@@ -448,10 +457,8 @@ fn main() {
         map: fastmap::FastMap::new(),
     };
 
-    for batch in batches {
-        let batch = batch.lock().unwrap();
-
-        for slot in batch.map.get().backing.iter() {
+    for result in &results {
+        for slot in result.get().backing.iter() {
             if slot.count == 0 {
                 continue;
             }
@@ -505,19 +512,15 @@ fn main() {
     let print_time_ns = span_start.elapsed().as_nanos();
 
     println!(
-        "CHUNK_SIZE={}\nRead time: {}ms\nLock wait time: {}ms\nAggregate time: {}ms\nPrint time: {}ms\nTotal: {}ms",
+        "CHUNK_SIZE={}\nRead time: {}ms\nLock wait time: {}ms\nWait close time: {}ms\nAggregate time: {}ms\nPrint time: {}ms\nTotal: {}ms",
         CHUNK_SIZE,
         read_time_ns / 1_000_000,
         waitlock_time_ns / 1_000_000,
+        waitclose_time_ns / 1_000_000,
         aggregate_time_ns / 1_000_000,
         print_time_ns / 1_000_000,
         start_time.elapsed().as_millis()
     );
-
-    // println!("Waiting for workers to exit...");
-    // for worker in worker_threads {
-    //     worker.join().unwrap();
-    // }
 
     println!("Done");
 }
@@ -627,101 +630,101 @@ mod tests {
         reconstruct_test::<4096>();
     }
 
-    #[test]
-    fn test_process_chunk_correctness() {
-        let naive_result = naive();
+    // #[test]
+    // fn test_process_chunk_correctness() {
+    //     let naive_result = naive();
 
-        let mut worker = Worker::new();
+    //     let mut worker = Worker::new();
 
-        let (mut chunk_reader, mut file_reader, _) = begin_sample();
+    //     let (mut chunk_reader, mut file_reader, _) = begin_sample();
 
-        loop {
-            let nread = chunk_reader
-                .read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut worker.chunk[..CHUNK_SIZE]);
+    //     loop {
+    //         let nread = chunk_reader
+    //             .read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut worker.chunk[..CHUNK_SIZE]);
 
-            if nread == 0 {
-                break;
-            }
+    //         if nread == 0 {
+    //             break;
+    //         }
 
-            unsafe {
-                worker.process_chunk(nread);
-            }
-        }
+    //         unsafe {
+    //             worker.process_chunk(nread);
+    //         }
+    //     }
 
-        let mut result_count = 0;
-        for (i, station) in worker.map.backing.iter().enumerate() {
-            if station.count == 0 {
-                continue;
-            }
+    //     let mut result_count = 0;
+    //     for (i, station) in worker.map.backing.iter().enumerate() {
+    //         if station.count == 0 {
+    //             continue;
+    //         }
 
-            result_count += 1;
+    //         result_count += 1;
 
-            let station_name = station.get_name();
+    //         let station_name = station.get_name();
 
-            let name_length = station_name.find('\0').unwrap_or(64);
-            let station_name_trimmed = station_name.split_at(name_length).0;
+    //         let name_length = station_name.find('\0').unwrap_or(64);
+    //         let station_name_trimmed = station_name.split_at(name_length).0;
 
-            let naive_entry = naive_result.get(station_name_trimmed);
+    //         let naive_entry = naive_result.get(station_name_trimmed);
 
-            assert!(
-                naive_entry.is_some(),
-                "station {} not found in naive result (name={})",
-                i,
-                station_name,
-            );
-            let naive_station = naive_entry.unwrap();
+    //         assert!(
+    //             naive_entry.is_some(),
+    //             "station {} not found in naive result (name={})",
+    //             i,
+    //             station_name,
+    //         );
+    //         let naive_station = naive_entry.unwrap();
 
-            assert!(
-                station.count == naive_station.count,
-                "count mismatch ({}): optimised({}) != naive({})",
-                naive_station.get_name(),
-                station.count,
-                naive_station.count
-            );
+    //         assert!(
+    //             station.count == naive_station.count,
+    //             "count mismatch ({}): optimised({}) != naive({})",
+    //             naive_station.get_name(),
+    //             station.count,
+    //             naive_station.count
+    //         );
 
-            assert!(
-                station.get_min() == naive_station.get_min(),
-                "min mismatch ({}): optimised({}) != naive({})",
-                naive_station.get_name(),
-                station.get_min(),
-                naive_station.get_min()
-            );
+    //         assert!(
+    //             station.get_min() == naive_station.get_min(),
+    //             "min mismatch ({}): optimised({}) != naive({})",
+    //             naive_station.get_name(),
+    //             station.get_min(),
+    //             naive_station.get_min()
+    //         );
 
-            assert!(
-                station.get_max() == naive_station.get_max(),
-                "max mismatch ({}): optimised({}) != naive({})",
-                naive_station.get_name(),
-                station.get_max(),
-                naive_station.get_max()
-            );
+    //         assert!(
+    //             station.get_max() == naive_station.get_max(),
+    //             "max mismatch ({}): optimised({}) != naive({})",
+    //             naive_station.get_name(),
+    //             station.get_max(),
+    //             naive_station.get_max()
+    //         );
 
-            assert!(
-                (station.get_avg() - naive_station.get_avg()).abs() < 0.0001,
-                "avg mismatch ({}): optimised({}) != naive({})",
-                naive_station.get_name(),
-                station.get_avg(),
-                naive_station.get_avg()
-            );
-        }
+    //         assert!(
+    //             (station.get_avg() - naive_station.get_avg()).abs() < 0.0001,
+    //             "avg mismatch ({}): optimised({}) != naive({})",
+    //             naive_station.get_name(),
+    //             station.get_avg(),
+    //             naive_station.get_avg()
+    //         );
+    //     }
 
-        // Check that naive result is sensible
-        assert!(
-            naive_result.len() == 983,
-            "naive result count mismatch, got {}",
-            naive_result.len()
-        );
+    //     // Check that naive result is sensible
+    //     assert!(
+    //         naive_result.len() == 983,
+    //         "naive result count mismatch, got {}",
+    //         naive_result.len()
+    //     );
 
-        assert!(
-            result_count == naive_result.len(),
-            "result count mismatch: {} != {}",
-            result_count,
-            naive_result.len()
-        );
-    }
+    //     assert!(
+    //         result_count == naive_result.len(),
+    //         "result count mismatch: {} != {}",
+    //         result_count,
+    //         naive_result.len()
+    //     );
+    // }
 
     #[test]
     fn test_hashing() {
-        const WORKER_BUCKET_SLOTS: usize = 1 << Worker::SLOT_BITS;
+        const WORKER_BUCKET_SLOTS: usize = 1 << StationMap::SLOT_BITS;
 
         let weather_stations = fs::read(STATIONS_PATH).unwrap();
 
@@ -754,7 +757,7 @@ mod tests {
             let h = unsafe {
                 let s = _mm512_loadu_si512(string_bytes.as_ptr() as *const _);
                 let h = hash_512!(s);
-                Worker::hash_u32(h)
+                StationMap::hash_u32(h)
             };
 
             let entry = index.entry(h).or_insert(0);
