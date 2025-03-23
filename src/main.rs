@@ -5,14 +5,14 @@
 use std::arch::x86_64::*;
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 
 use workset::WorkSet;
 
 mod fastmap;
 mod workset;
 
-const NUM_WORKERS: usize = 8;
+const NUM_WORKERS: usize = 5;
 
 macro_rules! hash_512 {
     ($s:ident) => {{
@@ -35,38 +35,13 @@ macro_rules! hash_512 {
     }};
 }
 
-fn print_m256(name: &str, m: __m256i) {
-    let mut arr = [0u8; 32];
-    unsafe {
-        _mm256_storeu_si256(arr.as_mut_ptr() as *mut _, m);
-    }
-    println!("{} {:x?}", name, arr);
-}
-
-fn print_m512(name: &str, m: __m512i) {
-    let mut arr = [0u8; 64];
-    unsafe {
-        _mm512_storeu_si512(arr.as_mut_ptr() as *mut _, m);
-    }
-    println!("{} {:?}", name, arr);
-}
-
-fn print_m512_string(name: &str, m: __m512i) {
-    let mut arr = [0u8; 64];
-    unsafe {
-        _mm512_storeu_si512(arr.as_mut_ptr() as *mut _, m);
-    }
-    println!("{} {:?}", name, String::from_utf8_lossy(&arr));
-}
-
 #[derive(Debug, Clone, Copy)]
 struct StationAggregate {
     min: i16,
     max: i16,
 
-    // Todo: check the dataset to see if any of these types can be shrunk
     count: u32,
-    sum: i64,
+    sum: i32,
 
     name: [u8; 64],
 }
@@ -96,10 +71,11 @@ impl StationAggregate {
 
     #[inline(always)]
     fn add(&mut self, temp: i16) {
+        // min/max should generate into cmovge/cmovle
         self.min = self.min.min(temp);
         self.max = self.max.max(temp);
         self.count += 1;
-        self.sum += temp as i64;
+        self.sum += temp as i32;
     }
 
     #[inline(always)]
@@ -127,7 +103,6 @@ impl StationAggregate {
 
     #[inline(always)]
     fn get_name(&self) -> Cow<'_, str> {
-        // Todo: there is a faster from_utf8_unchecked that does not check for valid utf8
         String::from_utf8_lossy(&self.name)
     }
 }
@@ -200,7 +175,6 @@ impl<'a> Worker<'a> {
     #[target_feature(
         enable = "avx,avx2,sse2,sse3,sse4.2,avx512f,avx512bw,avx512vl,avx512cd,avx512vbmi,avx512vbmi2,bmi1,popcnt"
     )]
-    #[inline(never)] // Todo: remove
     unsafe fn run(&mut self) {
         unsafe {
             // Prepare vectors that contain characters for parsing
@@ -239,6 +213,10 @@ impl<'a> Worker<'a> {
                 debug_assert!(!chunk.is_empty());
                 debug_assert!(chunk[chunk.len() - 1] == '\n' as u8);
 
+                // Main processing loop. The loop will read 512 bits from the input chunk and parse
+                // the station name and temperature from it using AVX-512 instructions to process 64
+                // bytes at a time. In the ideal scenario the body of the loop gets compiled to a branchess
+                // block of instructions with a single jump at the end to start on the next line
                 loop {
                     // Read the next 512-bits from the input chunk into in_vec. The chunk buffer contains
                     // a zero-filled 64 bytes padding at the end which may be read to the vector
@@ -260,16 +238,21 @@ impl<'a> Worker<'a> {
                     let name_vec = _mm512_mask_mov_epi8(zero_vec, name_line_mask, in_vec);
                     let name_hash = hash_512!(name_vec);
 
-                    // Parse temperature
+                    // Parse temperature. A digit mask will be constructed that contains
+                    // 1 for the bytes in the input that are ascii digits 0 to
                     let lt_mask = _mm512_cmp_epu8_mask(in_vec, char9_vec, _MM_CMPINT_LE);
                     let gt_mask = _mm512_cmp_epu8_mask(in_vec, char0_vec, _MM_CMPINT_NLT);
                     let digit_mask = _kand_mask64(_kand_mask64(lt_mask, gt_mask), rest_line_mask);
 
+                    // Extract digits from the input and compress them into a new vector. The low
+                    // 16 or 32 bits of the vector (depending if the input has 2 or 3 digits)
+                    // will contain the digits (in numeric, not ascii form) and the rest will be 0s
                     let digit_vec = _mm512_subs_epi8(in_vec, char0_vec);
                     let digit_vec = _mm512_maskz_compress_epi8(digit_mask, digit_vec);
 
-                    let neg_mask = _mm512_cmpeq_epi8_mask(in_vec, neg_vec);
-                    let is_neg = ((neg_mask >> (name_len + 1)) & 1) as u32;
+                    // Check if the line contains a "-" character and compress the mask into the bottom bit of is_neg
+                    let is_neg =
+                        (_mm512_mask_cmpeq_epi8_mask(rest_line_mask, in_vec, neg_vec) != 0) as u32;
 
                     // Shift digit mask to the right so it points to the byte before the first digit.
                     // This will be 0b01010 for temperatures with 2 digits and 0b10110 for temperatures with 3 digits.
@@ -280,21 +263,31 @@ impl<'a> Worker<'a> {
                     // (e.g shift 8 bits for 2 digit numbers or 0 bits for 3 digit numbers)
                     let shift = digit_mask_local & 0b1000;
 
+                    // Shift the digit vector right 8 bits if the temperature has 2 digits. This makes
+                    // sure that the 2 least significant digits are always in bits 8..23 of the vector
                     let shifted = _mm512_sllv_epi32(digit_vec, _mm512_set1_epi32(shift));
 
+                    // Multiply digits to the correct order of magnitude based on their bit position
                     let sum = _mm512_castsi512_si128(_mm512_maddubs_epi16(shifted, mul_vec));
+
+                    // Horizontally add bits 0..15 and 16..31 to create a single 16-bit temperature value
                     let sum = _mm_hadd_epi16(sum, sum);
 
+                    // Load the 16-bit temperature value into a 32-bit integer for sign processing & aggregation
+                    // (it could be loaded to a 16-bit integer directly which seemed to give slightly worse code gen)
                     let mut temperature = [0u8; 4];
                     _mm_storeu_si32(temperature.as_mut_ptr() as *mut _, sum);
 
+                    // broadcast sign bit into a full integer and use xor to flip the bits
+                    // to make the temperature negative in 2's complement
                     let neg = ((is_neg as i32) << 31) >> 31;
                     let temperature = (i32::from_ne_bytes(temperature) ^ neg) - neg;
 
                     let bucket = StationMap::hash_u32(name_hash);
-
                     let entry = self.map.get_mut().get_insert(name_hash, bucket);
 
+                    // Copy the name vector to the entry. Most of the time it is
+                    // already there, but the store is cheap and avoids branching
                     _mm512_storeu_si512(entry.name.as_mut_ptr() as *mut _, name_vec);
 
                     // According to spec temperature must be between -99.9 and 99.9
@@ -303,7 +296,7 @@ impl<'a> Worker<'a> {
 
                     #[cfg(feature = "safety_checks")]
                     {
-                    chunk = &chunk[line_len as usize + 1..];
+                        chunk = &chunk[line_len as usize + 1..];
                     }
                     #[cfg(not(feature = "safety_checks"))]
                     {
@@ -315,6 +308,7 @@ impl<'a> Worker<'a> {
                     }
                 }
 
+                // Commit to the set to signal that we are ready to accept a new one
                 self.set.commit(self.index, 0);
             }
         }
@@ -378,9 +372,7 @@ impl ChunkReader {
             .copy_from_slice(&out[excess_start..excess_start + self.excess_len]);
 
         // Zero out bytes from the end of previous excess + current data
-        // to the end of the buffer. Zeroing is important for vectorised processing.
-        // Todo: if we manage to bottleneck on reading, check if its possible to send the length
-        // and do zeroing with vectors.
+        // to the end of the buffer to clear any previously read data
         for z in excess_start..S {
             out[z] = 0;
         }
@@ -389,6 +381,7 @@ impl ChunkReader {
     }
 }
 
+#[inline]
 #[target_feature(enable = "avx512f,sse4.2")]
 unsafe fn process_stations<'a>(
     measurements_filepath: &str,
@@ -427,7 +420,8 @@ unsafe fn process_stations<'a>(
                 break;
             }
 
-            ws.commit(index, nread.try_into().unwrap());
+            debug_assert!(nread < u32::MAX as usize);
+            ws.commit(index, nread as u32);
         }
 
         ws.close();
@@ -478,8 +472,6 @@ unsafe fn process_stations<'a>(
 }
 
 fn main() {
-    use std::io::Write;
-
     let start_time = std::time::Instant::now();
     const FILE_PATH: &str = "data/measurements.txt";
 
@@ -488,8 +480,6 @@ fn main() {
     };
 
     let stations = unsafe { process_stations(FILE_PATH, &mut station_map) };
-
-    let print_start = std::time::Instant::now();
 
     let mut buf_writer = std::io::BufWriter::new(std::io::stdout().lock());
 
@@ -509,17 +499,12 @@ fn main() {
             ))
             .unwrap();
     }
-    buf_writer.write(b"}").unwrap();
+    buf_writer.write(b"}\n").unwrap();
 
     buf_writer.flush().unwrap();
 
-    let print_time = print_start.elapsed();
-
-    println!("\nPrint took: {}ms", print_time.as_millis());
-
-    println!("Took: {}ms", start_time.elapsed().as_millis());
-
-    println!("Done");
+    // println!("Took: {}ms", start_time.elapsed().as_millis());
+    // println!("Done");
 }
 
 #[cfg(test)]
