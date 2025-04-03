@@ -22,7 +22,6 @@ macro_rules! backing_size {
 /// - `SLOT_BITS` must be less than or equal to 4 (512/32 = max 16 slots per bucket)
 /// - The user provided hash function to generate a `bucket`-index for a given set of keys to be stored
 /// in this hash map must guarantee less than or equal to `(1<<SLOT_BITS)` equal `bucket`-index values
-///
 pub struct FastMap<const BUCKET_BITS: usize, const SLOT_BITS: usize, T>
 where
     [(); backing_size!()]:,

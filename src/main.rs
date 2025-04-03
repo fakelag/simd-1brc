@@ -7,12 +7,11 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 
-use workset::WorkSet;
-
 mod fastmap;
-mod workset;
+mod fastqueue;
 
 const NUM_WORKERS: usize = 5;
+const QUEUE_SIZE: usize = 100_000;
 
 macro_rules! hash_512 {
     ($s:ident) => {{
@@ -140,6 +139,7 @@ impl StationMap {
     }
 }
 
+#[derive(Clone)]
 struct Batch {
     pub chunk: Box<[u8; CHUNK_SIZE + CHUNK_ALIGN]>,
 }
@@ -156,16 +156,14 @@ impl Default for Batch {
 }
 
 struct Worker<'a> {
-    pub set: &'a workset::WorkSet<NUM_WORKERS, Batch>,
-    pub index: usize,
+    pub queue: &'a fastqueue::FastQueue<QUEUE_SIZE, (usize, Batch)>,
     pub map: StationMap,
 }
 
 impl<'a> Worker<'a> {
-    pub fn new(index: usize, set: &'a workset::WorkSet<NUM_WORKERS, Batch>) -> Self {
+    pub fn new(queue: &'a fastqueue::FastQueue<QUEUE_SIZE, (usize, Batch)>) -> Self {
         Self {
-            set,
-            index,
+            queue,
             map: StationMap {
                 map: fastmap::FastMap::new(),
             },
@@ -193,12 +191,10 @@ impl<'a> Worker<'a> {
             let mul_vec = _mm512_set1_epi32(0x00010A64);
 
             loop {
-                // Todo: set.start to return a guard with Drop impl that commits the set for safety
-                let (nread, batch) = match self.set.start(self.index) {
-                    Some(batch) => batch,
-                    None => break,
-                };
-                let nread = nread as usize;
+                let (nread, batch) = self.queue.pop();
+                if nread == 0 {
+                    break;
+                }
 
                 // Read constraints - nread is CHUNK_SIZE or less. self.chunk is CHUNK_SIZE + CHUNK_ALIGN,
                 // meaning that we can read up to 64 bytes into a mm512 past the end of the chunk. These reads
@@ -251,13 +247,13 @@ impl<'a> Worker<'a> {
                     let digit_vec = _mm512_maskz_compress_epi8(digit_mask, digit_vec);
 
                     // Check if the line contains a "-" character and compress the mask into the bottom bit of is_neg
-                    let is_neg =
+                    let is_negative =
                         (_mm512_mask_cmpeq_epi8_mask(rest_line_mask, in_vec, neg_vec) != 0) as u32;
 
                     // Shift digit mask to the right so it points to the byte before the first digit.
                     // This will be 0b01010 for temperatures with 2 digits and 0b10110 for temperatures with 3 digits.
                     // The first bit is always 0 (it's either the - sign or ; character depending if there is a sign character)
-                    let digit_mask_local = (digit_mask >> (name_len + is_neg)) as u32 as i32;
+                    let digit_mask_local = (digit_mask >> (name_len + is_negative)) as u32 as i32;
 
                     // Pick bit 3 and use it directly as the shift amount
                     // (e.g shift 8 bits for 2 digit numbers or 0 bits for 3 digit numbers)
@@ -280,7 +276,7 @@ impl<'a> Worker<'a> {
 
                     // broadcast sign bit into a full integer and use xor to flip the bits
                     // to make the temperature negative in 2's complement
-                    let neg = ((is_neg as i32) << 31) >> 31;
+                    let neg = ((is_negative as i32) << 31) >> 31;
                     let temperature = (i32::from_ne_bytes(temperature) ^ neg) - neg;
 
                     let bucket = StationMap::hash_u32(name_hash);
@@ -307,9 +303,6 @@ impl<'a> Worker<'a> {
                         break;
                     }
                 }
-
-                // Commit to the set to signal that we are ready to accept a new one
-                self.set.commit(self.index, 0);
             }
         }
     }
@@ -381,7 +374,6 @@ impl ChunkReader {
     }
 }
 
-#[inline]
 #[target_feature(enable = "avx512f,sse4.2")]
 unsafe fn process_stations<'a>(
     measurements_filepath: &str,
@@ -391,14 +383,14 @@ unsafe fn process_stations<'a>(
     let mut file_reader = BufReader::new(f);
     let mut chunk_reader = ChunkReader::new();
 
-    let ws = WorkSet::<NUM_WORKERS, Batch>::new();
+    let queue = fastqueue::FastQueue::<QUEUE_SIZE, (usize, Batch)>::new();
 
     let results = std::thread::scope(|s| {
-        let ws = &ws;
+        let queue = &queue;
 
         let worker_threads = (0..NUM_WORKERS)
-            .map(|ii| {
-                let mut worker = Worker::new(ii, ws);
+            .map(|_| {
+                let mut worker = Worker::new(queue);
 
                 s.spawn(move || {
                     unsafe {
@@ -410,21 +402,23 @@ unsafe fn process_stations<'a>(
             })
             .collect::<Vec<_>>();
 
+        let mut batch = Batch::default();
         loop {
-            let (index, set) = ws.acquire();
-
             let nread = chunk_reader
-                .read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut set.chunk[..CHUNK_SIZE]);
+                .read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut batch.chunk[..CHUNK_SIZE]);
 
             if nread == 0 {
                 break;
             }
 
             debug_assert!(nread < u32::MAX as usize);
-            ws.commit(index, nread as u32);
+            debug_assert!(nread <= CHUNK_SIZE);
+            queue.push((nread, batch.clone()));
         }
 
-        ws.close();
+        (0..NUM_WORKERS).for_each(|_| {
+            queue.push((0, batch.clone()));
+        });
 
         let results = worker_threads
             .into_iter()
@@ -503,7 +497,7 @@ fn main() {
 
     buf_writer.flush().unwrap();
 
-    // println!("Took: {}ms", start_time.elapsed().as_millis());
+    println!("Took: {}ms", start_time.elapsed().as_millis());
     // println!("Done");
 }
 
