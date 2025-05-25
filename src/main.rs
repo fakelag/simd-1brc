@@ -10,7 +10,7 @@ use std::io::{BufReader, Read, Write};
 mod fastmap;
 mod fastqueue;
 
-const NUM_WORKERS: usize = 5;
+const NUM_WORKERS: usize = 15;
 const QUEUE_SIZE: usize = 100_000;
 
 macro_rules! hash_512 {

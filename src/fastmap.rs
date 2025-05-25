@@ -40,10 +40,6 @@ where
     const INDEX_SIZE: u32 = 1 << BUCKET_BITS;
     const BUCKET_SIZE: u32 = 1 << SLOT_BITS;
 
-    const BACKING_MASK: u32 = Self::BACKING_SIZE - 1;
-    const INDEX_MASK: u32 = Self::INDEX_SIZE - 1;
-    const SLOT_MASK: u32 = (1 << SLOT_BITS) - 1;
-
     pub fn new() -> Self {
         Self {
             backing: vec![T::default(); Self::BACKING_SIZE as usize]
@@ -57,30 +53,45 @@ where
         }
     }
 
-    #[inline]
+    #[inline(never)]
     #[target_feature(enable = "sse2,avx512f,avx512vl,bmi1,popcnt")]
     pub unsafe fn get_insert(&mut self, key: u32, bucket: u32) -> &mut T {
         debug_assert!(bucket < Self::INDEX_SIZE);
 
         unsafe {
             // Load index of the bucket. The first element is a mask of already populated slots.
-            // The element contains an array of the populated keys. Next we will find which slot
+            // The second element contains an array of the populated keys. The code below will
+            // resolve which slot in the bucket to use for the given key. `safety_checks` feature
+            // can be enabled for debugging but allows rust to insert branches that will degrade performance
             #[cfg(feature = "safety_checks")]
             let index = &mut self.index[bucket as usize];
             #[cfg(not(feature = "safety_checks"))]
             let index = &mut self.index.get_unchecked_mut(bucket as usize);
 
             // Load 512 bits from the index key-part into a vector. Depending on SLOT_BITS this
-            // may load partially past the end of the array which won't be compared against due to the mask
+            // may load partially past the end of the array which won't be compared against due to the mask.
+            //
+            // `index.0` "mask-part" is a 16-bit mask that indicates which slots are populated. Slots
+            // are populated from least to most significant bit order. A situation where a more
+            // significant bit is set before a less significant one is not valid.
+            //      - E.g ..0001 means slot 0 is populated
+            //      - E.g ..0011 means slot 1 AND 0 are populated
+            //
+            // `index.1` "key-part" is an array of 32-bit keys, where each key corresponds to a slot
+            // in the bucket. The keys are stored in the same order as the mask bits, e.g from lsb to msb.
+            //
+            // index_vec will contain the 32-bit slot-keys for the current bucket in a vector
             let index_vec = _mm512_loadu_epi32(index.1.as_ptr() as *const _);
 
-            // Load key into 128-bit vector for collision detection
+            // Load key into each 32-bit slot of a 512-bit vector for collision detection
             let key_vec = _mm512_set1_epi32(key as i32);
 
             // Compare key against key vector in index using index.0 as mask
             let cmp_bits = _mm512_mask_cmp_epi32_mask(index.0, index_vec, key_vec, _MM_CMPINT_EQ);
 
-            // Count how many bits are set in the mask, e.g the number of currently populated slots
+            // Count how many bits are set in the mask, e.g the number of currently populated slots.
+            // In the case there is no match in the currently populated slots, we will use this value
+            // as the index of the next slot to insert into. This should compile to popcnt
             let insert_slot = index.0.count_ones();
 
             // Find a matching slot if any was found during the comparison above.
@@ -89,7 +100,8 @@ where
             let match_slot = _mm_tzcnt_32(cmp_bits as u32) as u32;
 
             // Find slot for given key and bucket. Match slot will be 32 if no
-            // match was found which will automatically select insert_slot
+            // match was found which will automatically select insert_slot.
+            // Rust should compile this to a branchless cmp+cmovb on x86_64
             let slot = match_slot.min(insert_slot as u32);
 
             // 1 if the bucket does not contain the key (an insert is needed)
@@ -116,6 +128,7 @@ where
         }
     }
 
+    /// Returns rough allocation size of the FastMap in bytes with given `T` type, `BUCKET_BITS` and `SLOT_BITS`
     pub const fn alloc_size() -> usize {
         std::mem::size_of::<T>() * Self::BACKING_SIZE as usize
             + std::mem::size_of::<(u16, [u32; 1 << SLOT_BITS])>() * (1 << BUCKET_BITS) as usize
