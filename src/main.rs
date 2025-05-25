@@ -192,7 +192,9 @@ impl<'a> Worker<'a> {
 
             loop {
                 let (nread, batch) = self.queue.pop();
+
                 if nread == 0 {
+                    // nread 0 signals end of processing
                     break;
                 }
 
@@ -211,8 +213,8 @@ impl<'a> Worker<'a> {
 
                 // Main processing loop. The loop will read 512 bits from the input chunk and parse
                 // the station name and temperature from it using AVX-512 instructions to process 64
-                // bytes at a time. In the ideal scenario the body of the loop gets compiled to a branchess
-                // block of instructions with a single jump at the end to start on the next line
+                // bytes (a full row) at a time. In the ideal scenario the body of the loop gets compiled
+                // to a branchess block of instructions with a single jump at the end to start on the next line
                 loop {
                     // Read the next 512-bits from the input chunk into in_vec. The chunk buffer contains
                     // a zero-filled 64 bytes padding at the end which may be read to the vector
@@ -235,7 +237,7 @@ impl<'a> Worker<'a> {
                     let name_hash = hash_512!(name_vec);
 
                     // Parse temperature. A digit mask will be constructed that contains
-                    // 1 for the bytes in the input that are ascii digits 0 to
+                    // 1 for the bytes in the input that are ascii digits 0 to 9
                     let lt_mask = _mm512_cmp_epu8_mask(in_vec, char9_vec, _MM_CMPINT_LE);
                     let gt_mask = _mm512_cmp_epu8_mask(in_vec, char0_vec, _MM_CMPINT_NLT);
                     let digit_mask = _kand_mask64(_kand_mask64(lt_mask, gt_mask), rest_line_mask);
@@ -263,10 +265,14 @@ impl<'a> Worker<'a> {
                     // sure that the 2 least significant digits are always in bits 8..23 of the vector
                     let shifted = _mm512_sllv_epi32(digit_vec, _mm512_set1_epi32(shift));
 
-                    // Multiply digits to the correct order of magnitude based on their bit position
+                    // Multiply 8-bit digits to the correct order of magnitude based on their bit position (producing 16-bit integers)
+                    // and add those 16-bit integers horizontally. E.g with input (order lsb..msb) [1, 2, 3, 0, ...]:
+                    // 1. Vertical multiply: [1, 2, 3, 0, ...] * [100, 10, 1, 0] -> [100, 20, 3, 0, ...]
+                    // 2. Horizont addition: [100, 20, 3, 0, ...] -> [120, 0, 3, 0, ...]
                     let sum = _mm512_castsi512_si128(_mm512_maddubs_epi16(shifted, mul_vec));
 
-                    // Horizontally add bits 0..15 and 16..31 to create a single 16-bit temperature value
+                    // Horizontally add bits 0..15 and 16..31 to create a single 16-bit temperature value:
+                    // [120, 0, 3, 0, ...] -> [123, 0, 0, 0, ...]
                     let sum = _mm_hadd_epi16(sum, sum);
 
                     // Load the 16-bit temperature value into a 32-bit integer for sign processing & aggregation

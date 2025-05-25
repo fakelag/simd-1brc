@@ -53,7 +53,7 @@ where
         }
     }
 
-    #[inline(never)]
+    #[inline]
     #[target_feature(enable = "sse2,avx512f,avx512vl,bmi1,popcnt")]
     pub unsafe fn get_insert(&mut self, key: u32, bucket: u32) -> &mut T {
         debug_assert!(bucket < Self::INDEX_SIZE);
