@@ -1,5 +1,3 @@
-cargo-features = ["edition2024"]
-
 [package]
 name = "simd-1brc"
 version = "0.1.0"
@@ -9,5 +7,9 @@ edition = "2024"
 default = []
 safety_checks = []
 
-[toolchain]
-channel = "nightly"
+[dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_System_Memory",
+    "Win32_Foundation",
+    "Win32_Security",
+] }

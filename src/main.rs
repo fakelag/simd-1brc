@@ -1,17 +1,15 @@
-#![feature(stdarch_x86_avx512)]
-#![feature(avx512_target_feature)]
 #![feature(generic_const_exprs)]
 
 use std::arch::x86_64::*;
 use std::borrow::Cow;
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::Write;
 
 mod fastmap;
 mod fastqueue;
+mod mmap;
 
 const NUM_WORKERS: usize = 15;
-const QUEUE_SIZE: usize = 100_000;
 
 macro_rules! hash_512 {
     ($s:ident) => {{
@@ -58,16 +56,6 @@ impl Default for StationAggregate {
 }
 
 impl StationAggregate {
-    fn new() -> Self {
-        Self {
-            min: i16::MAX,
-            max: i16::MIN,
-            count: 0,
-            sum: 0,
-            name: [0u8; 64],
-        }
-    }
-
     #[inline(always)]
     fn add(&mut self, temp: i16) {
         // min/max should generate into cmovge/cmovle
@@ -139,31 +127,15 @@ impl StationMap {
     }
 }
 
-#[derive(Clone)]
-struct Batch {
-    pub chunk: Box<[u8; CHUNK_SIZE + CHUNK_ALIGN]>,
-}
-
-impl Default for Batch {
-    fn default() -> Self {
-        Self {
-            chunk: vec![0u8; CHUNK_SIZE + CHUNK_ALIGN]
-                .into_boxed_slice()
-                .try_into()
-                .unwrap(),
-        }
-    }
-}
-
 struct Worker<'a> {
-    pub queue: &'a fastqueue::FastQueue<QUEUE_SIZE, (usize, Batch)>,
-    pub map: StationMap,
+    buf: &'a [u8],
+    map: StationMap,
 }
 
 impl<'a> Worker<'a> {
-    pub fn new(queue: &'a fastqueue::FastQueue<QUEUE_SIZE, (usize, Batch)>) -> Self {
+    fn new(buf: &'a [u8]) -> Self {
         Self {
-            queue,
+            buf,
             map: StationMap {
                 map: fastmap::FastMap::new(),
             },
@@ -190,193 +162,107 @@ impl<'a> Worker<'a> {
             // aggregation to get the final floating point value.
             let mul_vec = _mm512_set1_epi32(0x00010A64);
 
-            loop {
-                let (nread, batch) = self.queue.pop();
+            let mut chunk = self.buf;
 
-                if nread == 0 {
-                    // nread 0 signals end of processing
+            // Main processing loop. The loop will read 512 bits from the input chunk and parse
+            // the station name and temperature from it using AVX-512 instructions to process 64
+            // bytes (a full row) at a time. In the ideal scenario the body of the loop gets compiled
+            // to a branchess block of instructions with a single jump at the end to start on the next line
+            loop {
+                // Read the next 512-bits from the input chunk into in_vec. The chunk buffer contains
+                // a zero-filled 64 bytes padding at the end which may be read to the vector
+                let in_vec = _mm512_loadu_si512(chunk.as_ptr() as *const _);
+
+                // Test against special characters (; for name end and \n for line end) and
+                // find the lengths of the corresponding components in the input by counting trailing ones
+                let line_len = _mm512_cmpneq_epi8_mask(in_vec, nl_vec).trailing_ones();
+                let name_len = _mm512_cmpneq_epi8_mask(in_vec, semi_vec).trailing_ones();
+
+                // Create a mask that is 1s for the station name portion of the line
+                let name_line_mask = 0xFFFFFFFF_FFFFFFFFu64 >> (64 - name_len);
+
+                // Create a mask that is 1s for the portion of the line that does not belong to the station
+                // name, including ";-." characters (inside the quotes) and the temperature reading
+                let rest_line_mask = ((1 << (line_len - name_len)) - 1) << name_len;
+
+                // Generate a hash for the name. Bits that are not part of the station name are set to 0
+                let name_vec = _mm512_mask_mov_epi8(zero_vec, name_line_mask, in_vec);
+                let name_hash = hash_512!(name_vec);
+
+                // Parse temperature. A digit mask will be constructed that contains
+                // 1 for the bytes in the input that are ascii digits 0 to 9
+                let lt_mask = _mm512_cmp_epu8_mask(in_vec, char9_vec, _MM_CMPINT_LE);
+                let gt_mask = _mm512_cmp_epu8_mask(in_vec, char0_vec, _MM_CMPINT_NLT);
+                let digit_mask = _kand_mask64(_kand_mask64(lt_mask, gt_mask), rest_line_mask);
+
+                // Extract digits from the input and compress them into a new vector. The low
+                // 16 or 32 bits of the vector (depending if the input has 2 or 3 digits)
+                // will contain the digits (in numeric, not ascii form) and the rest will be 0s
+                let digit_vec = _mm512_subs_epi8(in_vec, char0_vec);
+                let digit_vec = _mm512_maskz_compress_epi8(digit_mask, digit_vec);
+
+                // Check if the line contains a "-" character and compress the mask into the bottom bit of is_neg
+                let is_negative =
+                    (_mm512_mask_cmpeq_epi8_mask(rest_line_mask, in_vec, neg_vec) != 0) as u32;
+
+                // Shift digit mask to the right so it points to the byte before the first digit.
+                // This will be 0b01010 for temperatures with 2 digits and 0b10110 for temperatures with 3 digits.
+                // The first bit is always 0 (it's either the - sign or ; character depending if there is a sign character)
+                let digit_mask_local = (digit_mask >> (name_len + is_negative)) as u32 as i32;
+
+                // Pick bit 3 and use it directly as the shift amount
+                // (e.g shift 8 bits for 2 digit numbers or 0 bits for 3 digit numbers)
+                let shift = digit_mask_local & 0b1000;
+
+                // Shift the digit vector right 8 bits if the temperature has 2 digits. This makes
+                // sure that the 2 least significant digits are always in bits 8..23 of the vector
+                let shifted = _mm512_sllv_epi32(digit_vec, _mm512_set1_epi32(shift));
+
+                // Multiply 8-bit digits to the correct order of magnitude based on their bit position (producing 16-bit integers)
+                // and add those 16-bit integers horizontally. E.g with input (order lsb..msb) [1, 2, 3, 0, ...]:
+                // 1. Vertical multiply: [1, 2, 3, 0, ...] * [100, 10, 1, 0] -> [100, 20, 3, 0, ...]
+                // 2. Horizont addition: [100, 20, 3, 0, ...] -> [120, 0, 3, 0, ...]
+                let sum = _mm512_castsi512_si128(_mm512_maddubs_epi16(shifted, mul_vec));
+
+                // Horizontally add bits 0..15 and 16..31 to create a single 16-bit temperature value:
+                // [120, 0, 3, 0, ...] -> [123, 0, 0, 0, ...]
+                let sum = _mm_hadd_epi16(sum, sum);
+
+                // Load the 16-bit temperature value into a 32-bit integer for sign processing & aggregation
+                // (it could be loaded to a 16-bit integer directly which seemed to give slightly worse code gen)
+                let mut temperature = [0u8; 4];
+                _mm_storeu_si32(temperature.as_mut_ptr() as *mut _, sum);
+
+                // broadcast sign bit into a full integer and use xor to flip the bits
+                // to make the temperature negative in 2's complement
+                let neg = ((is_negative as i32) << 31) >> 31;
+                let temperature = (i32::from_ne_bytes(temperature) ^ neg) - neg;
+
+                let bucket = StationMap::hash_u32(name_hash);
+                let entry = self.map.get_mut().get_insert(name_hash, bucket);
+
+                // Copy the name vector to the entry. Most of the time it is
+                // already there, but the store is cheap and avoids branching
+                _mm512_storeu_si512(entry.name.as_mut_ptr() as *mut _, name_vec);
+
+                // According to spec temperature must be between -99.9 and 99.9
+                debug_assert!(temperature >= -999 && temperature <= 999);
+                entry.add(temperature as i16);
+
+                #[cfg(feature = "safety_checks")]
+                {
+                    chunk = &chunk[line_len as usize + 1..];
+                }
+                #[cfg(not(feature = "safety_checks"))]
+                {
+                    chunk = &chunk.get_unchecked(line_len as usize + 1..);
+                }
+
+                if chunk.is_empty() {
                     break;
                 }
-
-                // Read constraints - nread is CHUNK_SIZE or less. self.chunk is CHUNK_SIZE + CHUNK_ALIGN,
-                // meaning that we can read up to 64 bytes into a mm512 past the end of the chunk. These reads
-                // will fill the remaining of the register with 0s
-                debug_assert!(nread <= CHUNK_SIZE);
-                debug_assert!(batch.chunk.len() <= CHUNK_SIZE + CHUNK_ALIGN);
-
-                let mut chunk = &batch.chunk[0..nread];
-
-                // Read constraints - the chunk should end with a newline. Any extras should be
-                // stored separately and prepended to the next chunk. Finally, the file ends in a new line
-                debug_assert!(!chunk.is_empty());
-                debug_assert!(chunk[chunk.len() - 1] == '\n' as u8);
-
-                // Main processing loop. The loop will read 512 bits from the input chunk and parse
-                // the station name and temperature from it using AVX-512 instructions to process 64
-                // bytes (a full row) at a time. In the ideal scenario the body of the loop gets compiled
-                // to a branchess block of instructions with a single jump at the end to start on the next line
-                loop {
-                    // Read the next 512-bits from the input chunk into in_vec. The chunk buffer contains
-                    // a zero-filled 64 bytes padding at the end which may be read to the vector
-                    let in_vec = _mm512_loadu_si512(chunk.as_ptr() as *const _);
-
-                    // Test against special characters (; for name end and \n for line end) and
-                    // find the lengths of the corresponding components in the input by counting trailing ones
-                    let line_len = _mm512_cmpneq_epi8_mask(in_vec, nl_vec).trailing_ones();
-                    let name_len = _mm512_cmpneq_epi8_mask(in_vec, semi_vec).trailing_ones();
-
-                    // Create a mask that is 1s for the station name portion of the line
-                    let name_line_mask = 0xFFFFFFFF_FFFFFFFFu64 >> (64 - name_len);
-
-                    // Create a mask that is 1s for the portion of the line that does not belong to the station
-                    // name, including ";-." characters (inside the quotes) and the temperature reading
-                    let rest_line_mask = ((1 << (line_len - name_len)) - 1) << name_len;
-
-                    // Generate a hash for the name. Bits that are not part of the station name are set to 0
-                    let name_vec = _mm512_mask_mov_epi8(zero_vec, name_line_mask, in_vec);
-                    let name_hash = hash_512!(name_vec);
-
-                    // Parse temperature. A digit mask will be constructed that contains
-                    // 1 for the bytes in the input that are ascii digits 0 to 9
-                    let lt_mask = _mm512_cmp_epu8_mask(in_vec, char9_vec, _MM_CMPINT_LE);
-                    let gt_mask = _mm512_cmp_epu8_mask(in_vec, char0_vec, _MM_CMPINT_NLT);
-                    let digit_mask = _kand_mask64(_kand_mask64(lt_mask, gt_mask), rest_line_mask);
-
-                    // Extract digits from the input and compress them into a new vector. The low
-                    // 16 or 32 bits of the vector (depending if the input has 2 or 3 digits)
-                    // will contain the digits (in numeric, not ascii form) and the rest will be 0s
-                    let digit_vec = _mm512_subs_epi8(in_vec, char0_vec);
-                    let digit_vec = _mm512_maskz_compress_epi8(digit_mask, digit_vec);
-
-                    // Check if the line contains a "-" character and compress the mask into the bottom bit of is_neg
-                    let is_negative =
-                        (_mm512_mask_cmpeq_epi8_mask(rest_line_mask, in_vec, neg_vec) != 0) as u32;
-
-                    // Shift digit mask to the right so it points to the byte before the first digit.
-                    // This will be 0b01010 for temperatures with 2 digits and 0b10110 for temperatures with 3 digits.
-                    // The first bit is always 0 (it's either the - sign or ; character depending if there is a sign character)
-                    let digit_mask_local = (digit_mask >> (name_len + is_negative)) as u32 as i32;
-
-                    // Pick bit 3 and use it directly as the shift amount
-                    // (e.g shift 8 bits for 2 digit numbers or 0 bits for 3 digit numbers)
-                    let shift = digit_mask_local & 0b1000;
-
-                    // Shift the digit vector right 8 bits if the temperature has 2 digits. This makes
-                    // sure that the 2 least significant digits are always in bits 8..23 of the vector
-                    let shifted = _mm512_sllv_epi32(digit_vec, _mm512_set1_epi32(shift));
-
-                    // Multiply 8-bit digits to the correct order of magnitude based on their bit position (producing 16-bit integers)
-                    // and add those 16-bit integers horizontally. E.g with input (order lsb..msb) [1, 2, 3, 0, ...]:
-                    // 1. Vertical multiply: [1, 2, 3, 0, ...] * [100, 10, 1, 0] -> [100, 20, 3, 0, ...]
-                    // 2. Horizont addition: [100, 20, 3, 0, ...] -> [120, 0, 3, 0, ...]
-                    let sum = _mm512_castsi512_si128(_mm512_maddubs_epi16(shifted, mul_vec));
-
-                    // Horizontally add bits 0..15 and 16..31 to create a single 16-bit temperature value:
-                    // [120, 0, 3, 0, ...] -> [123, 0, 0, 0, ...]
-                    let sum = _mm_hadd_epi16(sum, sum);
-
-                    // Load the 16-bit temperature value into a 32-bit integer for sign processing & aggregation
-                    // (it could be loaded to a 16-bit integer directly which seemed to give slightly worse code gen)
-                    let mut temperature = [0u8; 4];
-                    _mm_storeu_si32(temperature.as_mut_ptr() as *mut _, sum);
-
-                    // broadcast sign bit into a full integer and use xor to flip the bits
-                    // to make the temperature negative in 2's complement
-                    let neg = ((is_negative as i32) << 31) >> 31;
-                    let temperature = (i32::from_ne_bytes(temperature) ^ neg) - neg;
-
-                    let bucket = StationMap::hash_u32(name_hash);
-                    let entry = self.map.get_mut().get_insert(name_hash, bucket);
-
-                    // Copy the name vector to the entry. Most of the time it is
-                    // already there, but the store is cheap and avoids branching
-                    _mm512_storeu_si512(entry.name.as_mut_ptr() as *mut _, name_vec);
-
-                    // According to spec temperature must be between -99.9 and 99.9
-                    debug_assert!(temperature >= -999 && temperature <= 999);
-                    entry.add(temperature as i16);
-
-                    #[cfg(feature = "safety_checks")]
-                    {
-                        chunk = &chunk[line_len as usize + 1..];
-                    }
-                    #[cfg(not(feature = "safety_checks"))]
-                    {
-                        chunk = &chunk.get_unchecked(line_len as usize + 1..);
-                    }
-
-                    if chunk.is_empty() {
-                        break;
-                    }
-                }
             }
         }
-    }
-}
-
-struct ChunkReader {
-    excess_len: usize,
-    excess: [u8; CHUNK_ALIGN],
-}
-
-impl ChunkReader {
-    pub fn new() -> Self {
-        Self {
-            excess_len: 0,
-            excess: [0u8; CHUNK_ALIGN],
-        }
-    }
-}
-impl ChunkReader {
-    #[inline(always)]
-    pub fn read_chunk<const S: usize>(&mut self, reader: &mut impl Read, out: &mut [u8]) -> usize {
-        // Copy excess from a previous read to the start of the buffer
-        out[..self.excess_len].copy_from_slice(&self.excess[..self.excess_len]);
-
-        // prev_excess_len is the length of the excess currently sitting at the start of the buffer
-        let prev_excess_len = self.excess_len;
-
-        // Read new data after excess
-        // Todo: check if the read chunk size can be made exact (e.g not depending on excess_len)
-        let mut nread_total = 0;
-
-        loop {
-            let nread = reader
-                .read(&mut out[prev_excess_len + nread_total..])
-                .unwrap();
-
-            nread_total += nread;
-
-            // Calculate new newline cutoff for the current chunk
-            self.excess_len = if let Some(excess_len) = out
-                .iter()
-                .skip(prev_excess_len)
-                .take(nread_total)
-                .rev()
-                .position(|&c| c == b'\n')
-            {
-                excess_len
-            } else {
-                0
-            };
-
-            if self.excess_len > 0 || nread == 0 {
-                break;
-            }
-        }
-
-        // Copy new excess to the excess buffer
-        let excess_start = prev_excess_len + nread_total - self.excess_len;
-        self.excess[..self.excess_len]
-            .copy_from_slice(&out[excess_start..excess_start + self.excess_len]);
-
-        // Zero out bytes from the end of previous excess + current data
-        // to the end of the buffer to clear any previously read data
-        for z in excess_start..S {
-            out[z] = 0;
-        }
-
-        excess_start
     }
 }
 
@@ -386,47 +272,39 @@ unsafe fn process_stations<'a>(
     station_map: &'a mut StationMap,
 ) -> Vec<(String, &'a StationAggregate)> {
     let f = File::open(measurements_filepath).unwrap();
-    let mut file_reader = BufReader::new(f);
-    let mut chunk_reader = ChunkReader::new();
 
-    let queue = fastqueue::FastQueue::<QUEUE_SIZE, (usize, Batch)>::new();
+    let buf = mmap::mmap_file(&f).unwrap();
 
     let results = std::thread::scope(|s| {
-        let queue = &queue;
+        let chunk_size = buf.len() / NUM_WORKERS;
 
-        let worker_threads = (0..NUM_WORKERS)
-            .map(|_| {
-                let mut worker = Worker::new(queue);
+        let worker_threads =
+            (0..NUM_WORKERS).fold((Vec::with_capacity(NUM_WORKERS), 0usize), |mut acc, _| {
+                let mut split_at = (acc.1 + chunk_size).min(buf.len());
 
-                s.spawn(move || {
+                for i in split_at..buf.len() {
+                    if buf[i] == b'\n' {
+                        split_at = i + 1;
+                        break;
+                    }
+                }
+
+                let mut worker = Worker::new(&buf[acc.1..split_at]);
+
+                acc.0.push(s.spawn(move || {
                     unsafe {
                         worker.run();
                     }
 
                     return worker.map;
-                })
-            })
-            .collect::<Vec<_>>();
+                }));
+                acc.1 = split_at;
 
-        let mut batch = Batch::default();
-        loop {
-            let nread = chunk_reader
-                .read_chunk::<CHUNK_SIZE>(&mut file_reader, &mut batch.chunk[..CHUNK_SIZE]);
-
-            if nread == 0 {
-                break;
-            }
-
-            debug_assert!(nread < u32::MAX as usize);
-            debug_assert!(nread <= CHUNK_SIZE);
-            queue.push((nread, batch.clone()));
-        }
-
-        (0..NUM_WORKERS).for_each(|_| {
-            queue.push((0, batch.clone()));
-        });
+                return acc;
+            });
 
         let results = worker_threads
+            .0
             .into_iter()
             .map(|worker| worker.join().unwrap())
             .collect::<Vec<_>>();
@@ -512,50 +390,13 @@ mod tests {
     use std::{
         collections::BTreeMap,
         fs,
-        hash::{DefaultHasher, Hash, Hasher},
-        io::BufRead,
+        io::{BufRead, BufReader},
     };
 
     use super::*;
 
     const SAMPLE_PATH: &str = "data/sample16kb.txt";
     const STATIONS_PATH: &str = "data/weather_stations.csv";
-
-    fn get_hash(vec: Vec<u8>) -> u64 {
-        let mut hash = DefaultHasher::new();
-        vec.hash(&mut hash);
-        hash.finish()
-    }
-
-    fn begin_sample() -> (ChunkReader, BufReader<File>, u64) {
-        let f = File::open(SAMPLE_PATH).unwrap();
-        let file_reader = BufReader::new(f);
-
-        let hash = get_hash(fs::read(SAMPLE_PATH).unwrap());
-
-        let chunk_reader = ChunkReader::new();
-
-        (chunk_reader, file_reader, hash)
-    }
-
-    fn reconstruct_test<const S: usize>() {
-        let mut chunk = [0u8; S];
-
-        let (mut chunk_reader, mut file_reader, sample_hash) = begin_sample();
-
-        let mut reconstructed = Vec::new();
-        loop {
-            let read_size = chunk_reader.read_chunk::<S>(&mut file_reader, &mut chunk);
-
-            reconstructed.extend_from_slice(&chunk[..read_size]);
-
-            if read_size == 0 {
-                break;
-            }
-        }
-
-        assert_eq!(get_hash(reconstructed), sample_hash, "hash mismatch");
-    }
 
     fn naive(path: &str) -> BTreeMap<String, StationAggregate> {
         let mut index: BTreeMap<String, StationAggregate> = BTreeMap::new();
@@ -587,7 +428,7 @@ mod tests {
 
                         let name = buf[..name_len].to_string();
 
-                        let entry = index.entry(name).or_insert(StationAggregate::new());
+                        let entry = index.entry(name).or_insert(StationAggregate::default());
 
                         entry.name = name_bytes;
                         entry.add((temp * 10.0) as i16);
@@ -600,16 +441,6 @@ mod tests {
         }
 
         index
-    }
-
-    #[test]
-    fn test_chunked_reading() {
-        reconstruct_test::<10>();
-        reconstruct_test::<32>();
-        reconstruct_test::<64>();
-        reconstruct_test::<512>();
-        reconstruct_test::<1024>();
-        reconstruct_test::<4096>();
     }
 
     #[test]
