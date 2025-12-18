@@ -9,12 +9,41 @@ mod fastmap;
 mod fastqueue;
 mod mmap;
 
-const NUM_WORKERS: usize = 15;
+const NUM_WORKERS: usize = 32;
 
-macro_rules! hash_512 {
-    ($s:ident) => {{
+#[inline(always)]
+fn name_hash(name: &[u8]) -> u32 {
+    if name.len() > 64 {
+        let mut crc = 0;
+        let (chunks, remainder) = name.as_chunks::<8>();
+
+        for part in chunks {
+            unsafe {
+                crc = _mm_crc32_u64(crc, u64::from_ne_bytes(*part));
+            }
+        }
+
+        for &byte in remainder {
+            unsafe {
+                crc = _mm_crc32_u8(crc as u32, byte) as u64;
+            }
+        }
+
+        return crc as u32;
+    }
+
+    unsafe {
+        let load_mask = (1u64 << name.len()) - 1;
+        let input = _mm512_maskz_loadu_epi8(load_mask, name.as_ptr() as *const _);
+        name_hash_avx512(input)
+    }
+}
+
+#[inline(always)]
+fn name_hash_avx512(input: __m512i) -> u32 {
+    unsafe {
         let mut data = [0u64; 8];
-        _mm512_storeu_si512(data.as_mut_ptr() as *mut _, $s);
+        _mm512_storeu_si512(data.as_mut_ptr() as *mut _, input);
 
         let mut crc = 0;
 
@@ -29,33 +58,37 @@ macro_rules! hash_512 {
         crc = _mm_crc32_u64(crc, data[7]);
 
         crc as u32
-    }};
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
-struct StationAggregate {
+struct StationAggregate<'a> {
     min: i16,
     max: i16,
 
     count: u32,
     sum: i32,
 
-    name: [u8; 64],
+    name: &'a [u8],
+    name_len: u8,
 }
 
-impl Default for StationAggregate {
+impl Default for StationAggregate<'_> {
     fn default() -> Self {
         Self {
             min: i16::MAX,
             max: i16::MIN,
             count: 0,
             sum: 0,
-            name: [0u8; 64],
+            name: &[0u8; 0],
+            name_len: 0,
         }
     }
 }
 
-impl StationAggregate {
+const S: usize = std::mem::size_of::<StationAggregate>();
+
+impl StationAggregate<'_> {
     #[inline(always)]
     fn add(&mut self, temp: i16) {
         // min/max should generate into cmovge/cmovle
@@ -90,33 +123,30 @@ impl StationAggregate {
 
     #[inline(always)]
     fn get_name(&self) -> Cow<'_, str> {
-        String::from_utf8_lossy(&self.name)
+        String::from_utf8_lossy(&self.name[..self.name_len as usize])
     }
 }
 
-// Chunk align is the maximum input line length
-const CHUNK_ALIGN: usize = 64;
-const CHUNK_SIZE: usize = 4 * 1024 * 1024;
-
-struct StationMap {
-    map: fastmap::FastMap<{ Self::BUCKET_BITS }, { Self::SLOT_BITS }, StationAggregate>,
+struct StationMap<'a> {
+    map: fastmap::FastMap<{ Self::BUCKET_BITS }, { Self::SLOT_BITS }, StationAggregate<'a>>,
 }
 
-impl StationMap {
+impl<'a> StationMap<'a> {
     const BUCKET_BITS: usize = 13;
     const SLOT_BITS: usize = 4;
 
     #[inline(always)]
     pub fn get_mut(
         &mut self,
-    ) -> &mut fastmap::FastMap<{ Self::BUCKET_BITS }, { Self::SLOT_BITS }, StationAggregate> {
+    ) -> &mut fastmap::FastMap<{ Self::BUCKET_BITS }, { Self::SLOT_BITS }, StationAggregate<'a>>
+    {
         &mut self.map
     }
 
     #[inline(always)]
     pub fn get(
         &self,
-    ) -> &fastmap::FastMap<{ Self::BUCKET_BITS }, { Self::SLOT_BITS }, StationAggregate> {
+    ) -> &fastmap::FastMap<{ Self::BUCKET_BITS }, { Self::SLOT_BITS }, StationAggregate<'a>> {
         &self.map
     }
 
@@ -129,7 +159,7 @@ impl StationMap {
 
 struct Worker<'a> {
     buf: &'a [u8],
-    map: StationMap,
+    map: StationMap<'a>,
 }
 
 impl<'a> Worker<'a> {
@@ -142,9 +172,59 @@ impl<'a> Worker<'a> {
         }
     }
 
+    #[inline(never)]
+    fn process_line_slow(&mut self, chunk: &'a [u8]) -> usize {
+        let mut name_len = 0;
+        let mut line_len = 0;
+        let mut temp = 0i16;
+
+        for i in 0..chunk.len() {
+            let ch = chunk[i];
+            match ch {
+                b'\n' => {
+                    line_len = i;
+                    let sign = chunk[name_len + 1] == b'-';
+
+                    for j in chunk[name_len + 1..line_len].iter().enumerate() {
+                        match j.1 {
+                            b'0'..=b'9' => {
+                                temp = temp * 10 + (j.1 - b'0') as i16;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if sign {
+                        temp = -temp;
+                    }
+
+                    break;
+                }
+                b';' => {
+                    name_len = i;
+                }
+                _ => {}
+            }
+        }
+
+        let name_hash = name_hash(&chunk[..name_len]);
+        let bucket = StationMap::hash_u32(name_hash);
+
+        unsafe {
+            let entry: &mut StationAggregate<'_> = self.map.get_mut().get_insert(name_hash, bucket);
+
+            entry.name = &chunk[..name_len];
+            entry.name_len = name_len as u8;
+            entry.add(temp);
+        }
+
+        line_len
+    }
+
     #[target_feature(
         enable = "avx,avx2,sse2,sse3,sse4.2,avx512f,avx512bw,avx512vl,avx512cd,avx512vbmi,avx512vbmi2,bmi1,popcnt"
     )]
+    #[inline(never)]
     unsafe fn run(&mut self) {
         unsafe {
             // Prepare vectors that contain characters for parsing
@@ -168,7 +248,7 @@ impl<'a> Worker<'a> {
             // the station name and temperature from it using AVX-512 instructions to process 64
             // bytes (a full row) at a time. In the ideal scenario the body of the loop gets compiled
             // to a branchess block of instructions with a single jump at the end to start on the next line
-            loop {
+            while !chunk.is_empty() {
                 // Read the next 512-bits from the input chunk into in_vec. The chunk buffer contains
                 // a zero-filled 64 bytes padding at the end which may be read to the vector
                 let in_vec = _mm512_loadu_si512(chunk.as_ptr() as *const _);
@@ -177,6 +257,21 @@ impl<'a> Worker<'a> {
                 // find the lengths of the corresponding components in the input by counting trailing ones
                 let line_len = _mm512_cmpneq_epi8_mask(in_vec, nl_vec).trailing_ones();
                 let name_len = _mm512_cmpneq_epi8_mask(in_vec, semi_vec).trailing_ones();
+
+                if line_len == 64 {
+                    let line_len = self.process_line_slow(chunk);
+
+                    #[cfg(feature = "safety_checks")]
+                    {
+                        chunk = &chunk[line_len as usize + 1..];
+                    }
+                    #[cfg(not(feature = "safety_checks"))]
+                    {
+                        chunk = &chunk.get_unchecked(line_len as usize + 1..);
+                    }
+
+                    continue;
+                }
 
                 // Create a mask that is 1s for the station name portion of the line
                 let name_line_mask = 0xFFFFFFFF_FFFFFFFFu64 >> (64 - name_len);
@@ -187,7 +282,7 @@ impl<'a> Worker<'a> {
 
                 // Generate a hash for the name. Bits that are not part of the station name are set to 0
                 let name_vec = _mm512_mask_mov_epi8(zero_vec, name_line_mask, in_vec);
-                let name_hash = hash_512!(name_vec);
+                let name_hash = name_hash_avx512(name_vec);
 
                 // Parse temperature. A digit mask will be constructed that contains
                 // 1 for the bytes in the input that are ascii digits 0 to 9
@@ -243,7 +338,8 @@ impl<'a> Worker<'a> {
 
                 // Copy the name vector to the entry. Most of the time it is
                 // already there, but the store is cheap and avoids branching
-                _mm512_storeu_si512(entry.name.as_mut_ptr() as *mut _, name_vec);
+                entry.name = chunk.as_ref();
+                entry.name_len = name_len as u8;
 
                 // According to spec temperature must be between -99.9 and 99.9
                 debug_assert!(temperature >= -999 && temperature <= 999);
@@ -257,10 +353,6 @@ impl<'a> Worker<'a> {
                 {
                     chunk = &chunk.get_unchecked(line_len as usize + 1..);
                 }
-
-                if chunk.is_empty() {
-                    break;
-                }
             }
         }
     }
@@ -268,12 +360,10 @@ impl<'a> Worker<'a> {
 
 #[target_feature(enable = "avx512f,sse4.2")]
 unsafe fn process_stations<'a>(
-    measurements_filepath: &str,
-    station_map: &'a mut StationMap,
-) -> Vec<(String, &'a StationAggregate)> {
-    let f = File::open(measurements_filepath).unwrap();
-
-    let buf = mmap::mmap_file(&f).unwrap();
+    f: &'a File,
+    station_map: &'a mut StationMap<'a>,
+) -> Vec<(String, &'a StationAggregate<'a>)> {
+    let buf = mmap::mmap_file(f).unwrap();
 
     let results = std::thread::scope(|s| {
         let chunk_size = buf.len() / NUM_WORKERS;
@@ -319,8 +409,7 @@ unsafe fn process_stations<'a>(
             }
 
             let entry = unsafe {
-                let s = _mm512_loadu_si512(slot.name.as_ptr() as *const _);
-                let hash = hash_512!(s);
+                let hash = name_hash(&slot.name[..slot.name_len as usize]);
 
                 station_map
                     .get_mut()
@@ -357,7 +446,9 @@ fn main() {
         map: fastmap::FastMap::new(),
     };
 
-    let stations = unsafe { process_stations(FILE_PATH, &mut station_map) };
+    let f = File::open(FILE_PATH).unwrap();
+
+    let stations = unsafe { process_stations(&f, &mut station_map) };
 
     let mut buf_writer = std::io::BufWriter::new(std::io::stdout().lock());
 
@@ -395,11 +486,12 @@ mod tests {
 
     use super::*;
 
+    const TEST100B_PATH: &str = "data/test100b.txt";
     const SAMPLE_PATH: &str = "data/sample16kb.txt";
     const STATIONS_PATH: &str = "data/weather_stations.csv";
 
-    fn naive(path: &str) -> BTreeMap<String, StationAggregate> {
-        let mut index: BTreeMap<String, StationAggregate> = BTreeMap::new();
+    fn naive<'a>(path: &str, mut name_buf: &'a mut [u8]) -> BTreeMap<String, StationAggregate<'a>> {
+        let mut index: BTreeMap<String, StationAggregate<'a>> = BTreeMap::new();
 
         let f = File::open(path).unwrap();
         let mut file_reader = BufReader::new(f);
@@ -418,20 +510,35 @@ mod tests {
                     b';' => {
                         let name_len = ii;
 
-                        let mut name_bytes = [0u8; 64];
-
-                        for i in 0..name_len {
-                            name_bytes[i] = buf.as_bytes()[i];
-                        }
+                        assert!(
+                            name_len <= 100,
+                            "station name \"{}\" ({} characters) too long",
+                            &buf[..name_len],
+                            name_len
+                        );
 
                         let temp = buf[name_len + 1..].trim().parse::<f64>().unwrap();
 
                         let name = buf[..name_len].to_string();
 
-                        let entry = index.entry(name).or_insert(StationAggregate::default());
+                        let entry = index
+                            .entry(name.clone())
+                            .or_insert(StationAggregate::default());
 
-                        entry.name = name_bytes;
                         entry.add((temp * 10.0) as i16);
+
+                        if entry.name_len == 0 {
+                            for (i, &b) in name.as_bytes().iter().enumerate() {
+                                name_buf[i] = b;
+                            }
+
+                            let (n, rest) = name_buf.split_at_mut(name_len);
+
+                            name_buf = rest;
+
+                            entry.name = n;
+                            entry.name_len = name_len as u8;
+                        }
 
                         break 'top;
                     }
@@ -444,14 +551,17 @@ mod tests {
     }
 
     #[test]
-    fn test_process_chunk_correctness() {
-        let naive_result = naive(SAMPLE_PATH);
+    fn test_correctness() {
+        let mut name_buf = vec![0u8; 1 * 1024 * 1024].into_boxed_slice();
+        let naive_result = naive(SAMPLE_PATH, &mut name_buf);
 
         let mut station_map = StationMap {
             map: fastmap::FastMap::new(),
         };
 
-        let stations = unsafe { process_stations(SAMPLE_PATH, &mut station_map) };
+        let f = File::open(SAMPLE_PATH).unwrap();
+
+        let stations = unsafe { process_stations(&f, &mut station_map) };
 
         let mut result_count = 0;
         for (i, (station_name, station)) in stations.into_iter().enumerate() {
@@ -516,6 +626,74 @@ mod tests {
     }
 
     #[test]
+    fn test_100b() {
+        let mut name_buf = vec![0u8; 1 * 1024 * 1024].into_boxed_slice();
+        let naive_result = naive(TEST100B_PATH, &mut name_buf);
+
+        let mut station_map = StationMap {
+            map: fastmap::FastMap::new(),
+        };
+
+        let f = File::open(TEST100B_PATH).unwrap();
+
+        let stations = unsafe { process_stations(&f, &mut station_map) };
+
+        let mut result_count = 0;
+        for (i, (station_name, station)) in stations.into_iter().enumerate() {
+            result_count += 1;
+
+            let naive_entry = naive_result.get(station_name.trim_end_matches('\0'));
+
+            assert!(
+                naive_entry.is_some(),
+                "station {} not found in naive result (name={})",
+                i,
+                station_name,
+            );
+            let naive_station = naive_entry.unwrap();
+
+            assert!(
+                station.count == naive_station.count,
+                "count mismatch ({}): optimised({}) != naive({})",
+                naive_station.get_name(),
+                station.count,
+                naive_station.count
+            );
+
+            assert!(
+                station.get_min() == naive_station.get_min(),
+                "min mismatch ({}): optimised({}) != naive({})",
+                naive_station.get_name(),
+                station.get_min(),
+                naive_station.get_min()
+            );
+
+            assert!(
+                station.get_max() == naive_station.get_max(),
+                "max mismatch ({}): optimised({}) != naive({})",
+                naive_station.get_name(),
+                station.get_max(),
+                naive_station.get_max()
+            );
+
+            assert!(
+                (station.get_avg() - naive_station.get_avg()).abs() < 0.0001,
+                "avg mismatch ({}): optimised({}) != naive({})",
+                naive_station.get_name(),
+                station.get_avg(),
+                naive_station.get_avg()
+            );
+        }
+
+        assert!(
+            result_count == naive_result.len(),
+            "result count mismatch: {} != {}",
+            result_count,
+            naive_result.len()
+        );
+    }
+
+    #[test]
     fn test_hashing() {
         const WORKER_BUCKET_SLOTS: usize = 1 << StationMap::SLOT_BITS;
 
@@ -543,15 +721,7 @@ mod tests {
         let mut index: BTreeMap<u32, usize> = BTreeMap::new();
 
         for station_name in &weather_stations {
-            let mut string_bytes = [0u8; 64];
-            for (i, byte) in station_name.bytes().enumerate() {
-                string_bytes[i] = byte;
-            }
-            let h = unsafe {
-                let s = _mm512_loadu_si512(string_bytes.as_ptr() as *const _);
-                let h = hash_512!(s);
-                StationMap::hash_u32(h)
-            };
+            let h = StationMap::hash_u32(name_hash(station_name.as_bytes()));
 
             let entry = index.entry(h).or_insert(0);
             *entry += 1;
