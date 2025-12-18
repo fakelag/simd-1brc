@@ -62,7 +62,7 @@ where
             // Load index of the bucket. The first element is a mask of already populated slots.
             // The second element contains an array of the populated keys. The code below will
             // resolve which slot in the bucket to use for the given key. `safety_checks` feature
-            // can be enabled for debugging but allows rust to insert branches that will degrade performance
+            // can be enabled for debugging but allows rust to insert branches.
             #[cfg(feature = "safety_checks")]
             let index = &mut self.index[bucket as usize];
             #[cfg(not(feature = "safety_checks"))]

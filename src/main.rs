@@ -68,10 +68,10 @@ unsafe impl Send for NamePtr {}
 #[derive(Debug, Clone, Copy)]
 #[repr(packed)]
 struct StationAggregate<'a> {
-    min: i16,   // +11
-    max: i16,   // +11 => 22
-    count: u32, // +30 => 52
-    sum: i64,   // +41 => 93
+    min: i16,
+    max: i16,
+    count: u32,
+    sum: i64,
     name_len: u8,
     name: NamePtr,
     __phantom: std::marker::PhantomData<&'a u8>,
@@ -313,6 +313,7 @@ impl<'a> Worker<'a> {
                 let rest_line_mask = ((1 << (line_len - name_len)) - 1) << name_len;
 
                 // Generate a hash for the name. Bits that are not part of the station name are set to 0
+                // ~40ms
                 let name_vec = _mm512_mask_mov_epi8(zero_vec, name_line_mask, in_vec);
                 let name_hash = name_hash_avx512(name_vec);
 
@@ -366,12 +367,15 @@ impl<'a> Worker<'a> {
                 let temperature = (i32::from_ne_bytes(temperature) ^ neg) - neg;
 
                 let bucket = StationMap::hash_u32(name_hash);
+
+                // ~100ms
                 let entry = self.map.get_mut().get_insert(name_hash, bucket);
 
                 // Copy the name vector to the entry. Most of the time it is
                 // already there, but the store is cheap and avoids branching
-                entry.name = NamePtr(chunk.as_ptr());
+                // ~230ms
                 entry.name_len = name_len as u8;
+                entry.name = NamePtr(chunk.as_ptr());
 
                 // According to spec temperature must be between -99.9 and 99.9
                 debug_assert!(temperature >= -999 && temperature <= 999);
