@@ -62,15 +62,19 @@ fn name_hash_avx512(input: __m512i) -> u32 {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct NamePtr(*const u8);
+unsafe impl Send for NamePtr {}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(packed)]
 struct StationAggregate<'a> {
-    min: i16,
-    max: i16,
-
-    count: u32,
-    sum: i32,
-
-    name: &'a [u8],
+    min: i16,   // +11
+    max: i16,   // +11 => 22
+    count: u32, // +30 => 52
+    sum: i64,   // +41 => 93
     name_len: u8,
+    name: NamePtr,
+    __phantom: std::marker::PhantomData<&'a u8>,
 }
 
 impl Default for StationAggregate<'_> {
@@ -80,8 +84,10 @@ impl Default for StationAggregate<'_> {
             max: i16::MIN,
             count: 0,
             sum: 0,
-            name: &[0u8; 0],
             name_len: 0,
+            name: NamePtr(std::ptr::null()),
+
+            __phantom: std::marker::PhantomData,
         }
     }
 }
@@ -95,7 +101,7 @@ impl StationAggregate<'_> {
         self.min = self.min.min(temp);
         self.max = self.max.max(temp);
         self.count += 1;
-        self.sum += temp as i32;
+        self.sum += temp as i64;
     }
 
     #[inline(always)]
@@ -123,7 +129,9 @@ impl StationAggregate<'_> {
 
     #[inline(always)]
     fn get_name(&self) -> Cow<'_, str> {
-        String::from_utf8_lossy(&self.name[..self.name_len as usize])
+        String::from_utf8_lossy(unsafe {
+            std::slice::from_raw_parts(self.name.0, self.name_len as usize)
+        })
     }
 }
 
@@ -154,6 +162,30 @@ impl<'a> StationMap<'a> {
     fn hash_u32(val: u32) -> u32 {
         // Black magic seed for optimal distribution
         val.wrapping_mul(0x5bc9d60a) >> (32 - Self::BUCKET_BITS)
+    }
+
+    #[inline(always)]
+    fn merge(&mut self, from: &[StationMap<'a>]) {
+        for result in from {
+            for slot in result.get().backing.iter() {
+                if slot.count == 0 {
+                    continue;
+                }
+
+                let entry = unsafe {
+                    let name = std::slice::from_raw_parts(slot.name.0, slot.name_len as usize);
+                    let hash = name_hash(name);
+
+                    self.get_mut().get_insert(hash, StationMap::hash_u32(hash))
+                };
+
+                if entry.count == 0 {
+                    *entry = *slot;
+                } else {
+                    entry.collapse(&slot);
+                }
+            }
+        }
     }
 }
 
@@ -213,7 +245,7 @@ impl<'a> Worker<'a> {
         unsafe {
             let entry: &mut StationAggregate<'_> = self.map.get_mut().get_insert(name_hash, bucket);
 
-            entry.name = &chunk[..name_len];
+            entry.name = NamePtr(chunk.as_ptr());
             entry.name_len = name_len as u8;
             entry.add(temp);
         }
@@ -338,7 +370,7 @@ impl<'a> Worker<'a> {
 
                 // Copy the name vector to the entry. Most of the time it is
                 // already there, but the store is cheap and avoids branching
-                entry.name = chunk.as_ref();
+                entry.name = NamePtr(chunk.as_ptr());
                 entry.name_len = name_len as u8;
 
                 // According to spec temperature must be between -99.9 and 99.9
@@ -402,27 +434,7 @@ unsafe fn process_stations<'a>(
         results
     });
 
-    for result in &results {
-        for slot in result.get().backing.iter() {
-            if slot.count == 0 {
-                continue;
-            }
-
-            let entry = unsafe {
-                let hash = name_hash(&slot.name[..slot.name_len as usize]);
-
-                station_map
-                    .get_mut()
-                    .get_insert(hash, StationMap::hash_u32(hash))
-            };
-
-            if entry.count == 0 {
-                *entry = *slot;
-            } else {
-                entry.collapse(&slot);
-            }
-        }
-    }
+    station_map.merge(&results);
 
     let mut stations = station_map
         .get()
@@ -490,8 +502,28 @@ mod tests {
     const SAMPLE_PATH: &str = "data/sample16kb.txt";
     const STATIONS_PATH: &str = "data/weather_stations.csv";
 
-    fn naive<'a>(path: &str, mut name_buf: &'a mut [u8]) -> BTreeMap<String, StationAggregate<'a>> {
-        let mut index: BTreeMap<String, StationAggregate<'a>> = BTreeMap::new();
+    struct NaiveAggregate {
+        min: f64,
+        max: f64,
+        count: u32,
+        sum: f64,
+        name: String,
+    }
+
+    impl Default for NaiveAggregate {
+        fn default() -> Self {
+            Self {
+                min: f64::MAX,
+                max: f64::MIN,
+                count: 0,
+                sum: 0.0,
+                name: String::new(),
+            }
+        }
+    }
+
+    fn naive<'a>(path: &str) -> BTreeMap<String, NaiveAggregate> {
+        let mut index: BTreeMap<String, NaiveAggregate> = BTreeMap::new();
 
         let f = File::open(path).unwrap();
         let mut file_reader = BufReader::new(f);
@@ -523,22 +555,13 @@ mod tests {
 
                         let entry = index
                             .entry(name.clone())
-                            .or_insert(StationAggregate::default());
+                            .or_insert(NaiveAggregate::default());
 
-                        entry.add((temp * 10.0) as i16);
-
-                        if entry.name_len == 0 {
-                            for (i, &b) in name.as_bytes().iter().enumerate() {
-                                name_buf[i] = b;
-                            }
-
-                            let (n, rest) = name_buf.split_at_mut(name_len);
-
-                            name_buf = rest;
-
-                            entry.name = n;
-                            entry.name_len = name_len as u8;
-                        }
+                        entry.name = name;
+                        entry.count += 1;
+                        entry.sum += temp;
+                        entry.min = entry.min.min(temp);
+                        entry.max = entry.max.max(temp);
 
                         break 'top;
                     }
@@ -550,16 +573,14 @@ mod tests {
         index
     }
 
-    #[test]
-    fn test_correctness() {
-        let mut name_buf = vec![0u8; 1 * 1024 * 1024].into_boxed_slice();
-        let naive_result = naive(SAMPLE_PATH, &mut name_buf);
+    fn correctness_test_file(file_path: &str) -> (BTreeMap<String, NaiveAggregate>, usize) {
+        let naive_result = naive(file_path);
 
         let mut station_map = StationMap {
             map: fastmap::FastMap::new(),
         };
 
-        let f = File::open(SAMPLE_PATH).unwrap();
+        let f = File::open(file_path).unwrap();
 
         let stations = unsafe { process_stations(&f, &mut station_map) };
 
@@ -577,38 +598,48 @@ mod tests {
             );
             let naive_station = naive_entry.unwrap();
 
+            let station_count = station.count;
+
             assert!(
-                station.count == naive_station.count,
+                station_count == naive_station.count,
                 "count mismatch ({}): optimised({}) != naive({})",
-                naive_station.get_name(),
-                station.count,
+                naive_station.name,
+                station_count,
                 naive_station.count
             );
 
             assert!(
-                station.get_min() == naive_station.get_min(),
+                station.get_min() == naive_station.min,
                 "min mismatch ({}): optimised({}) != naive({})",
-                naive_station.get_name(),
+                naive_station.name,
                 station.get_min(),
-                naive_station.get_min()
+                naive_station.min,
             );
 
             assert!(
-                station.get_max() == naive_station.get_max(),
+                station.get_max() == naive_station.max,
                 "max mismatch ({}): optimised({}) != naive({})",
-                naive_station.get_name(),
+                naive_station.name,
                 station.get_max(),
-                naive_station.get_max()
+                naive_station.max,
             );
 
+            let naive_avg = naive_station.sum / naive_station.count as f64;
             assert!(
-                (station.get_avg() - naive_station.get_avg()).abs() < 0.0001,
+                (station.get_avg() - naive_avg).abs() < 0.0001,
                 "avg mismatch ({}): optimised({}) != naive({})",
-                naive_station.get_name(),
+                naive_station.name,
                 station.get_avg(),
-                naive_station.get_avg()
+                naive_avg,
             );
         }
+
+        (naive_result, result_count)
+    }
+
+    #[test]
+    fn test_correctness() {
+        let (naive_result, result_count) = correctness_test_file(SAMPLE_PATH);
 
         // Check that naive result is sensible
         assert!(
@@ -627,69 +658,121 @@ mod tests {
 
     #[test]
     fn test_100b() {
-        let mut name_buf = vec![0u8; 1 * 1024 * 1024].into_boxed_slice();
-        let naive_result = naive(TEST100B_PATH, &mut name_buf);
-
-        let mut station_map = StationMap {
-            map: fastmap::FastMap::new(),
-        };
-
-        let f = File::open(TEST100B_PATH).unwrap();
-
-        let stations = unsafe { process_stations(&f, &mut station_map) };
-
-        let mut result_count = 0;
-        for (i, (station_name, station)) in stations.into_iter().enumerate() {
-            result_count += 1;
-
-            let naive_entry = naive_result.get(station_name.trim_end_matches('\0'));
-
-            assert!(
-                naive_entry.is_some(),
-                "station {} not found in naive result (name={})",
-                i,
-                station_name,
-            );
-            let naive_station = naive_entry.unwrap();
-
-            assert!(
-                station.count == naive_station.count,
-                "count mismatch ({}): optimised({}) != naive({})",
-                naive_station.get_name(),
-                station.count,
-                naive_station.count
-            );
-
-            assert!(
-                station.get_min() == naive_station.get_min(),
-                "min mismatch ({}): optimised({}) != naive({})",
-                naive_station.get_name(),
-                station.get_min(),
-                naive_station.get_min()
-            );
-
-            assert!(
-                station.get_max() == naive_station.get_max(),
-                "max mismatch ({}): optimised({}) != naive({})",
-                naive_station.get_name(),
-                station.get_max(),
-                naive_station.get_max()
-            );
-
-            assert!(
-                (station.get_avg() - naive_station.get_avg()).abs() < 0.0001,
-                "avg mismatch ({}): optimised({}) != naive({})",
-                naive_station.get_name(),
-                station.get_avg(),
-                naive_station.get_avg()
-            );
-        }
+        let (naive_result, result_count) = correctness_test_file(TEST100B_PATH);
 
         assert!(
             result_count == naive_result.len(),
             "result count mismatch: {} != {}",
             result_count,
             naive_result.len()
+        );
+    }
+
+    #[test]
+    fn test_stress() {
+        let mut buf = Vec::new();
+
+        let mut chunk = String::new();
+
+        for _ in 0..1000 {
+            chunk.push_str("m;-99.9\n");
+            chunk.push_str("M;99.9\n");
+        }
+
+        for _ in 0..10_000 {
+            buf.extend_from_slice(chunk.as_bytes());
+        }
+
+        let mut results = StationMap {
+            map: fastmap::FastMap::new(),
+        };
+
+        let buf = buf.as_slice();
+
+        for _ in 0..10 {
+            std::thread::scope(|s| {
+                let workers = (0..10)
+                    .map(|_| {
+                        let mut worker = Worker::new(buf);
+                        s.spawn(|| unsafe {
+                            worker.run();
+                            worker.map
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|t| t.join().unwrap())
+                    .collect::<Vec<_>>();
+
+                results.merge(workers.as_slice());
+            });
+        }
+
+        let key_min = name_hash(b"m");
+        let key_max = name_hash(b"M");
+
+        let bucket_min = StationMap::hash_u32(key_min);
+        let bucket_max = StationMap::hash_u32(key_max);
+
+        let (result_min, result_max) = unsafe {
+            let result_min: StationAggregate = *results.get_mut().get_insert(key_min, bucket_min);
+            let result_max: StationAggregate = *results.get_mut().get_insert(key_max, bucket_max);
+
+            (result_min, result_max)
+        };
+
+        let row_count = 1_000_000_000u32;
+        let min_val = -99.9f64;
+        let max_val = 99.9f64;
+
+        let min_sum = (min_val * row_count as f64) as i64;
+        let max_sum = (max_val * row_count as f64) as i64;
+
+        let result_min_count = result_min.count;
+        let result_max_count = result_max.count;
+        let result_min_sum = result_min.sum as i64;
+        let result_max_sum = result_max.sum as i64;
+
+        assert!(
+            result_min_count == row_count,
+            "Min count mismatch: {} != {}",
+            result_min_count,
+            row_count
+        );
+
+        assert!(
+            result_max_count == row_count,
+            "Max count mismatch: {} != {}",
+            result_max_count,
+            row_count
+        );
+
+        assert!(
+            result_min.get_min() == min_val,
+            "Min min mismatch: {} != {}",
+            result_min.get_min(),
+            min_val
+        );
+
+        assert!(
+            result_max.get_max() == max_val,
+            "Max max mismatch: {} != {}",
+            result_max.get_max(),
+            max_val
+        );
+
+        assert!(
+            result_min_sum == min_sum * 10,
+            "Min sum mismatch: {} != {}",
+            result_min_sum,
+            min_sum
+        );
+
+        assert!(
+            result_max_sum == max_sum * 10,
+            "Max sum mismatch: {} != {}",
+            result_max_sum,
+            max_sum
         );
     }
 
